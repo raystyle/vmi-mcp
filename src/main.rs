@@ -51,7 +51,7 @@ use rmcp::handler::server::wrapper::Json;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{schemars, tool, tool_router, ErrorData};
+use rmcp::{ErrorData, schemars, tool, tool_router};
 
 const BIND_ADDRESS: &str = "0.0.0.0:9881";
 const SCROLLBACK_CAP: usize = 4 * 1024 * 1024;
@@ -105,11 +105,12 @@ impl Workbench {
         }
     }
 
-    #[tool(description = "Workbench heartbeat: pid, session name, user, uptime, open panes")]
+    #[tool(description = "Workbench heartbeat: pid, session id, session name, user, uptime, open panes")]
     fn status(&self) -> Json<serde_json::Value> {
         let panes = self.panes.lock().unwrap().len();
         Json(serde_json::json!({
             "pid": std::process::id(),
+            "session_id": current_session_id(),
             "session": std::env::var("SESSIONNAME").unwrap_or_default(),
             "user": user_string(),
             "uptime_s": self.started.map(|s| s.elapsed().as_secs()).unwrap_or(0),
@@ -547,6 +548,27 @@ impl Workbench {
             "exe": args.exe,
         })))
     }
+}
+
+#[cfg(windows)]
+fn current_session_id() -> u32 {
+    // SESSIONNAME env is empty under schtasks birth; ask the OS instead
+    let mut sid = 0u32;
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn ProcessIdToSessionId(pid: u32, sid: *mut u32) -> i32;
+        }
+        if ProcessIdToSessionId(std::process::id(), &mut sid) != 0 {
+            return sid;
+        }
+    }
+    0
+}
+
+#[cfg(not(windows))]
+fn current_session_id() -> u32 {
+    0
 }
 
 fn user_string() -> String {
@@ -1022,7 +1044,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
-    eprintln!("vmi-mcp v0.6.1 listening on http://{BIND_ADDRESS}/mcp");
+    eprintln!("vmi-mcp v0.6.2 listening on http://{BIND_ADDRESS}/mcp");
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;

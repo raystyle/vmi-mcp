@@ -39,6 +39,14 @@ use unicode_width::UnicodeWidthChar;
 
 type Client = RunningService<RoleClient, ClientConfig>;
 
+/// Header/status chrome context: endpoint plus the daemon's session and
+/// user (Console -> session 1, Services -> session 0).
+struct UiCtx {
+    url: String,
+    session: String,
+    user: String,
+}
+
 async fn call(svc: &Client, name: &str, args: JsonObject) -> Result<Value> {
     let params = CallToolRequestParams::new(name.to_owned()).with_arguments(args);
     let result = match svc.call_tool_once(params).await? {
@@ -783,27 +791,40 @@ fn key_to_ansi(
 // UI
 // ---------------------------------------------------------------------------
 
-fn draw(f: &mut Frame, panes: &[Pane], focus: usize, url: &str) {
+fn draw(f: &mut Frame, panes: &[Pane], focus: usize, ctx: &UiCtx) {
     let area = f.area();
-    // two status rows: panes+title on top, url+keys below (a single row
-    // overflows a narrow split)
-    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(area);
-    let main = chunks[0];
-    let bar = chunks[1];
+    // shell grid fills the screen; separator; 3-row status block
+    // (panes + endpoint / title + session + user / key help)
+    let rows = Layout::vertical([
+        Constraint::Min(1),    // shell
+        Constraint::Length(1), // ── separator
+        Constraint::Length(3), // status
+    ])
+    .split(area);
 
     if let Some(p) = panes.get(focus) {
-        render_grid(f, main, p);
+        render_grid(f, rows[0], p);
     } else {
-        f.render_widget(Paragraph::new("no panes - Ctrl-B c to open"), main);
+        f.render_widget(Paragraph::new("no panes - Ctrl-B c to open"), rows[0]);
     }
-    f.render_widget(Paragraph::new(status_lines(panes, focus, url)), bar);
+    f.render_widget(separator(width_of(&rows[1])), rows[1]);
+    f.render_widget(Paragraph::new(status_lines(panes, focus, ctx)), rows[2]);
+}
+
+fn width_of(r: &Rect) -> usize {
+    r.width as usize
+}
+
+fn separator(w: usize) -> Paragraph<'static> {
+    Paragraph::new(Line::from(Span::styled(
+        "─".repeat(w),
+        Style::new().fg(Color::DarkGray),
+    )))
 }
 
 fn render_grid(f: &mut Frame, area: Rect, p: &Pane) {
     let scr = &p.screen;
     let buf = if scr.on_alt { &scr.alt } else { &scr.cells };
-    let content = f.area(); // silence unused warnings in some versions
-    let _ = content;
     for r in 0..scr.rows.min(area.height as usize) {
         for c in 0..scr.cols.min(area.width as usize) {
             let cell = &buf[r * scr.cols + c];
@@ -819,43 +840,59 @@ fn render_grid(f: &mut Frame, area: Rect, p: &Pane) {
     }
 }
 
-fn status_lines(panes: &[Pane], focus: usize, url: &str) -> Vec<Line<'static>> {
-    // row 1: brand + pane chips + remote window title
-    let mut top = vec![Span::styled(
+fn status_lines(panes: &[Pane], focus: usize, ctx: &UiCtx) -> Vec<Line<'static>> {
+    // row 1: brand + pane chips (focus mark, alive, idle) + endpoint
+    let mut chips = vec![Span::styled(
         " vmi-tui ".to_string(),
         Style::new().fg(Color::Black).bg(Color::Cyan),
     )];
     if panes.is_empty() {
-        top.push(Span::raw("no panes"));
+        chips.push(Span::raw("no panes"));
     }
     for (i, p) in panes.iter().enumerate() {
-        let mark = if i == focus { '*' } else { ' ' };
-        let state = if !p.alive { "dead" } else { "live" };
-        let idle = p.last_output.elapsed().as_secs();
-        let txt = format!(" {mark}{}[{state},{idle}s] ", p.id);
+        let mark = if i == focus { "▶" } else { "" };
+        let state = if !p.alive {
+            "已退出".to_string()
+        } else {
+            format!("空闲{}s", p.last_output.elapsed().as_secs())
+        };
+        let txt = format!("{mark}面板{}[{state}] ", p.id);
         let style = if i == focus {
             Style::new().fg(Color::Black).bg(Color::Green)
         } else {
             Style::new().fg(Color::Gray)
         };
-        top.push(Span::styled(txt, style));
+        chips.push(Span::styled(txt, style));
     }
+    // row 2: remote window title (cmd's "管理员: " prefix stripped) |
+    // session 0/1 | daemon user
     let title = panes
         .get(focus)
         .map(|p| p.screen.title.clone())
         .filter(|t| !t.is_empty())
-        .unwrap_or_default();
-
-    // row 2: endpoint + key help
-    let bottom = vec![
-        Span::styled(format!(" {title} "), Style::new().fg(Color::Cyan)),
-        Span::raw(url.to_string()),
-        Span::styled(
-            "  Ctrl-B: n/p next/prev, c open, x kill, 0-9 jump, q quit ".to_string(),
-            Style::new().fg(Color::DarkGray),
-        ),
-    ];
-    vec![Line::from(top), Line::from(bottom)]
+        .map(|t| t.trim_start_matches("管理员: ").trim().to_string())
+        .unwrap_or_else(|| "-".to_string());
+    // row 3: endpoint on its own line + short key help
+    vec![
+        Line::from(chips),
+        Line::from(vec![
+            Span::styled(format!(" {title} "), Style::new().fg(Color::Cyan)),
+            Span::styled(
+                format!("| session {} | {} ", ctx.session, ctx.user),
+                Style::new().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!(" {}", ctx.url),
+                Style::new().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                "  Ctrl-B: n/p c x q".to_string(),
+                Style::new().fg(Color::DarkGray),
+            ),
+        ]),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -937,11 +974,49 @@ async fn main() -> Result<()> {
         return self_test_run(&svc, &mut panes, focus).await;
     }
 
+    // daemon session/user for the status block (Console => interactive 1)
+    let (session, user) = match call(&svc, "status", obj(json!({}))).await {
+        Ok(v) => {
+            // session_id is the OS truth (SESSIONNAME env is empty under
+            // schtasks birth); name decorates when present
+            let sid = v.get("session_id").and_then(Value::as_u64).unwrap_or(0);
+            let name = v
+                .get("session")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let shown = if sid > 0 {
+                if name.is_empty() {
+                    sid.to_string()
+                } else {
+                    format!("{sid} ({name})")
+                }
+            } else if !name.is_empty() {
+                name
+            } else {
+                "?".to_string()
+            };
+            (
+                shown,
+                v.get("user")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        }
+        Err(_) => (String::new(), String::new()),
+    };
+    let ctx = UiCtx {
+        url: args.url.clone(),
+        session,
+        user,
+    };
+
     // TUI owns the terminal: alt screen + raw mode, restored on drop
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
     crossterm::terminal::enable_raw_mode()?;
-    let tui_result = tui_run(&svc, &mut panes, &mut focus, &args.url, cols, rows).await;
+    let tui_result = tui_run(&svc, &mut panes, &mut focus, &ctx, cols, rows).await;
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen)?;
     tui_result
@@ -951,14 +1026,27 @@ async fn tui_run(
     svc: &Client,
     panes: &mut Vec<Pane>,
     focus: &mut usize,
-    url: &str,
+    ctx: &UiCtx,
     cols: usize,
     rows: usize,
 ) -> Result<()> {
     let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
-    let mut events = crossterm::event::EventStream::new();
     let mut pending_prefix = false;
     let mut need_resize = (rows, cols);
+
+    // EventStream::next() is NOT cancel-safe: losing the race in select!
+    // would drop a keystroke already pulled from the queue (seen live:
+    // trailing chars of send-text bursts vanished). Pump events through
+    // a dedicated task into an mpsc channel; recv() is cancel-safe.
+    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut events = crossterm::event::EventStream::new();
+        while let Some(ev) = events.next().await {
+            if etx.send(ev).is_err() {
+                break;
+            }
+        }
+    });
 
     // focus takes DSR ownership
     if let Some(p) = panes.get(*focus) {
@@ -1008,11 +1096,11 @@ async fn tui_run(
         }
 
         // ---- draw ----
-        terminal.draw(|f| draw(f, panes, *focus, url))?;
+        terminal.draw(|f| draw(f, panes, *focus, ctx))?;
 
         // ---- input / tick ----
         let ev = tokio::select! {
-            e = events.next() => e,
+            e = erx.recv() => e,
             _ = tokio::time::sleep(Duration::from_millis(50)) => None,
         };
         let Some(Ok(event)) = ev else {
