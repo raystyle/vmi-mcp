@@ -1,0 +1,64 @@
+name: release
+# build all platforms on tag, attach artifacts to the GitHub Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rustflags: "-C target-feature=+crt-static"
+            ext: .exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rustflags: ""
+            ext: ""
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            rustflags: ""
+            ext: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            rustflags: ""
+            ext: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          strip vmi-mcp${{ matrix.ext }} || true
+          NAME=vmi-mcp-${GITHUB_REF_NAME:-manual}-${{ matrix.target }}
+          mkdir -p package
+          cp vmi-mcp${{ matrix.ext }} package/
+          (cd package && tar czf ../$NAME.tar.gz * 2>/dev/null || zip ../$NAME.zip *)
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vmi-mcp-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/vmi-mcp-*.tar.gz
+          if-no-files-found: ignore
+      - name: Release attach
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/${{ matrix.target }}/release/vmi-mcp-*.tar.gz
+            target/${{ matrix.target }}/release/vmi-mcp-*.zip
