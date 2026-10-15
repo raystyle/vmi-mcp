@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use ratatui::backend::CrosstermBackend;
-use ratatui::buffer::Cell as UICell;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -801,28 +800,88 @@ struct Hits {
     chips_y: u16,
 }
 
-fn draw(f: &mut Frame, panes: &[Pane], focus: usize, ctx: &UiCtx, hits: &mut Hits) {
+fn draw(
+    f: &mut Frame,
+    panes: &[Pane],
+    focus: usize,
+    ctx: &UiCtx,
+    hits: &mut Hits,
+    log: &[(String, i64, String)],
+    show_log: bool,
+) {
     let area = f.area();
-    // shell grid fills the screen; separator; 3-row status block
-    // (panes + endpoint / title + session + user / key help)
-    let rows = Layout::vertical([
-        Constraint::Min(1),    // shell
-        Constraint::Length(1), // ── separator
-        Constraint::Length(3), // status
-    ])
-    .split(area);
-
-    if let Some(p) = panes.get(focus) {
-        render_grid(f, rows[0], p);
-    } else {
-        f.render_widget(Paragraph::new("no panes - Ctrl-B c to open"), rows[0]);
+    // shell on top; wait-command transcript block (its own screen,
+    // never mixed into the shell grid); separator; 3-row status
+    let mut cons = vec![Constraint::Min(1)];
+    if show_log {
+        cons.push(Constraint::Length(6)); // transcript
     }
-    f.render_widget(separator(width_of(&rows[1])), rows[1]);
+    cons.push(Constraint::Length(1)); // ── separator
+    cons.push(Constraint::Length(3)); // status
+    let rows = Layout::vertical(cons).split(area);
+
+    let mut idx = 0;
+    let main = rows[idx];
+    idx += 1;
+    if let Some(p) = panes.get(focus) {
+        render_grid(f, main, p);
+    } else {
+        f.render_widget(Paragraph::new("no panes - Ctrl-B c to open"), main);
+    }
+    if show_log {
+        f.render_widget(transcript_block(log), rows[idx]);
+        idx += 1;
+    }
+    f.render_widget(separator(width_of(&rows[idx])), rows[idx]);
+    idx += 1;
     let status = status_lines(panes, focus, ctx);
-    let status_rows = rows[2];
+    let status_rows = rows[idx];
     f.render_widget(Paragraph::new(status.lines), status_rows);
     hits.chip_hits = status.chip_hits;
     hits.chips_y = status_rows.y;
+}
+
+/// Wait-command transcript: newest records last, dim styling, output
+/// summary indented under each command line.
+fn transcript_block(log: &[(String, i64, String)]) -> Paragraph<'static> {
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        " wait 通道命令记录".to_string(),
+        Style::new().fg(Color::Black).bg(Color::Yellow),
+    ))];
+    if log.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (无 wait 命令)".to_string(),
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    let tail = if log.len() > 4 {
+        &log[log.len() - 4..]
+    } else {
+        log
+    };
+    for (cmd, exit, out) in tail {
+        let mark = if *exit == 0 { "✓" } else { "✗" };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {mark} $ "),
+                Style::new().fg(if *exit == 0 { Color::Green } else { Color::Red }),
+            ),
+            Span::raw(cmd.chars().take(90).collect::<String>()),
+            Span::styled(format!(" [exit {exit}]"), Style::new().fg(Color::DarkGray)),
+        ]));
+        let first = out
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        if !first.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("   {}", first.chars().take(100).collect::<String>()),
+                Style::new().fg(Color::DarkGray),
+            )));
+        }
+    }
+    Paragraph::new(lines)
 }
 
 fn width_of(r: &Rect) -> usize {
@@ -1070,6 +1129,8 @@ async fn tui_run(
     // a dedicated task into an mpsc channel; recv() is cancel-safe.
     let mut hits = Hits::default();
     let mut last_scan = Instant::now();
+    let mut log_entries: Vec<(String, i64, String)> = Vec::new();
+    let mut show_log = true;
     let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut events = crossterm::event::EventStream::new();
@@ -1100,6 +1161,26 @@ async fn tui_run(
         // behind our back; external pane_kill removes panes) ----
         if last_scan.elapsed() > Duration::from_secs(1) {
             last_scan = Instant::now();
+            if let Ok(v) = call(svc, "log_list", obj(json!({}))).await {
+                log_entries = v
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|e| {
+                                Some((
+                                    e.get("cmd")?.as_str()?.to_string(),
+                                    e.get("exit_code")?.as_i64()?,
+                                    e.get("out")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string(),
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
             if let Ok(v) = call(svc, "pane_list", obj(json!({}))).await {
                 let ids: Vec<u32> = v
                     .get("panes")
@@ -1188,7 +1269,7 @@ async fn tui_run(
         }
 
         // ---- draw ----
-        terminal.draw(|f| draw(f, panes, *focus, ctx, &mut hits))?;
+        terminal.draw(|f| draw(f, panes, *focus, ctx, &mut hits, &log_entries, show_log))?;
 
         // ---- input / tick ----
         let ev = tokio::select! {
@@ -1250,6 +1331,9 @@ async fn tui_run(
                                 panes.push(np);
                                 *focus = panes.len() - 1;
                             }
+                        }
+                        crossterm::event::KeyCode::Char('l') => {
+                            show_log = !show_log;
                         }
                         crossterm::event::KeyCode::Char('x') => {
                             if let Some(p) = panes.get(*focus) {

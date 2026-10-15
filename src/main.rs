@@ -51,7 +51,7 @@ use rmcp::handler::server::wrapper::Json;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{ErrorData, schemars, tool, tool_router};
+use rmcp::{schemars, tool, tool_router, ErrorData};
 
 const BIND_ADDRESS: &str = "0.0.0.0:9881";
 const SCROLLBACK_CAP: usize = 4 * 1024 * 1024;
@@ -90,11 +90,20 @@ struct Pane {
     created: Instant,
 }
 
+/// One captured wait-command record (shown in the TUI transcript area).
+struct WaitLog {
+    cmd: String,
+    exit_code: i64,
+    out: String, // first ~1.5KB of stdout+stderr
+    at: std::time::SystemTime,
+}
+
 #[derive(Clone, Default)]
 struct Workbench {
     started: Option<Instant>,
     panes: Arc<Mutex<HashMap<u32, Arc<Mutex<Pane>>>>>,
     next_id: Arc<Mutex<u32>>,
+    wait_log: Arc<Mutex<std::collections::VecDeque<WaitLog>>>,
 }
 
 #[tool_router(server_handler)]
@@ -104,6 +113,7 @@ impl Workbench {
             started: Some(Instant::now()),
             panes: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(1)),
+            wait_log: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         }
     }
 
@@ -304,6 +314,25 @@ impl Workbench {
         ))
     }
 
+    #[tool(
+        description = "Recent wait-command records: [{cmd, exit_code, out, age_s}] newest last; the TUI transcript area renders these"
+    )]
+    fn log_list(&self) -> Json<serde_json::Value> {
+        let log = self.wait_log.lock().unwrap();
+        let list: Vec<serde_json::Value> = log
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "cmd": e.cmd,
+                    "exit_code": e.exit_code,
+                    "out": e.out,
+                    "age_s": e.at.elapsed().map(|d| d.as_secs()).unwrap_or(0),
+                })
+            })
+            .collect();
+        Json(serde_json::json!({ "entries": list }))
+    }
+
     #[tool(description = "List open panes: [{id, alive, buffer_len, cursor, idle_ms, attached}]")]
     fn pane_list(&self) -> Json<serde_json::Value> {
         let panes = self.panes.lock().unwrap();
@@ -433,9 +462,7 @@ impl Workbench {
                     match session {
                         1 => run_captured(&args.cmd, timeout),
                         0 => run_session0(&args.cmd, timeout),
-                        other => Err(err_invalid(&format!(
-                            "session must be 0 or 1, got {other}"
-                        ))),
+                        other => Err(err_invalid(&format!("session must be 0 or 1, got {other}"))),
                     }
                 }
                 #[cfg(not(windows))]
@@ -444,6 +471,31 @@ impl Workbench {
                     run_captured(&args.cmd, timeout)
                 }
             };
+            if let Ok(env) = &result {
+                let g = |k: &str| -> String {
+                    env.0
+                        .get(k)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let mut out = format!("{}{}", g("stdout"), g("stderr"));
+                out.truncate(1536);
+                let mut log = self.wait_log.lock().unwrap();
+                if log.len() >= 50 {
+                    log.pop_front();
+                }
+                log.push_back(WaitLog {
+                    cmd: args.cmd.clone(),
+                    exit_code: env
+                        .0
+                        .get("exit_code")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(-1),
+                    out,
+                    at: std::time::SystemTime::now(),
+                });
+            }
             result
         } else {
             self.shell_fire(&args.cmd)
@@ -1043,12 +1095,15 @@ async fn main() -> anyhow::Result<()> {
     let panes: Arc<Mutex<HashMap<u32, Arc<Mutex<Pane>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let next_id: Arc<Mutex<u32>> = Arc::new(Mutex::new(1));
     let started = Instant::now();
+    let wait_log: Arc<Mutex<std::collections::VecDeque<WaitLog>>> =
+        Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let service = StreamableHttpService::new(
         move || {
             Ok(Workbench {
                 started: Some(started),
                 panes: Arc::clone(&panes),
                 next_id: Arc::clone(&next_id),
+                wait_log: Arc::clone(&wait_log),
             })
         },
         LocalSessionManager::default().into(),
@@ -1056,7 +1111,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
-    eprintln!("vmi-mcp v0.6.3 listening on http://{BIND_ADDRESS}/mcp");
+    eprintln!("vmi-mcp v0.7.0 listening on http://{BIND_ADDRESS}/mcp");
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
