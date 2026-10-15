@@ -8,14 +8,26 @@ user's DPAPI secrets), spoken to over streamable-HTTP from any session.
 One daemon, one command face, session 0/1 stops being the caller's
 problem.
 
-## Tools (v0.2)
+## Tools v0.5
 
 | tool | what |
 | --- | --- |
-| `pane_open` / `pane_read` / `pane_send` / `pane_resize` / `pane_kill` | long-lived shell panes (ConPTY on Windows, pty on Linux; cursor-based multiplexed read + send) |
-| `shell` | one-shot captured execution; Windows `session=1` interactive desktop vs `session=0` headless SYSTEM (passwordless schtasks channel) |
+| `pane_open` / `pane_read` / `pane_send` / `pane_resize` / `pane_kill` | long-lived shell panes (ConPTY on Windows, pty on Linux/macOS; cursor-based multiplexed read + send; cursors are monotonic, `data_hex` carries exact raw bytes) |
+| `pane_status` | buffer/idle heartbeat: `alive`, `buffer_len`, `idle_ms`, `attached`; stable idle means the command finished |
+| `pane_attach` / `pane_detach` | raw-terminal attach mode: the server stops answering DSR cursor queries so the attach client's real terminal replies (full-screen apps render correctly); detach restores headless replies |
+| `shell` | fire-and-forget into pane 0 by default (tmux semantics: fire, poll `pane_read`); `wait=true` blocks with captured output; Windows `session=0` headless SYSTEM via the passwordless schtasks channel |
 | `spawn` | visible GUI launch (argv, no shell quoting) |
 | `status` | heartbeat: pid, session, user, uptime, open panes |
+
+## vmi-attach
+
+The companion client mirrors a remote pane onto the local terminal:
+raw bytes out, keystrokes in, terminal-size sync, DSR answered by your
+real terminal. Detach with `Ctrl-B q` (herdr convention).
+
+```
+vmi-attach --url http://<guest-ip>:9881/mcp --pane 0
+```
 
 ## Run
 
@@ -40,14 +52,18 @@ which must be listed in `allowed_hosts` (rmcp DNS-rebinding guard).
 
 ## Platform support
 
-Windows (ConPTY) and Linux (pty) in one build; macOS planned on the
-same portable-pty path. GitHub Actions builds all targets on tags
+Windows (ConPTY), Linux (pty), macOS (pty): one portable-pty build
+path, verified on all three. GitHub Actions builds all targets on tags
 (`v*`): windows x86_64 (static CRT), linux x86_64/aarch64, macOS
-aarch64.
+aarch64. Both binaries ship: `vmi-mcp` (daemon) and `vmi-attach`
+(attach client).
 
-## Known limits (v0.2)
+## Known limits v0.5
 
 - session-0 scratch files live in the system temp dir
 - kill reaches the direct child only
 - MCP session state is in-memory; daemon restart drops live sessions
 - de-elevation path (`runas /trustlevel`) is fire-and-forget
+- vmi-attach polls over HTTP (50ms active / 200ms idle); it is a
+  mirror, not a zero-latency pty; fine for driving, visible on
+  full-motion video

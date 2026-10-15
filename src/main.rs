@@ -20,6 +20,16 @@
 //! No PsExec, no WinPTY agent, no OpenConsole.exe, no powershell.exe.
 //! Release builds run windowless (windows subsystem): a background
 //! daemon with no console flash on the desktop.
+//!
+//! v0.5 (raw-attach fidelity, 2026-10-15):
+//!   cursor  — pane_read cursors are monotonic: absolute = drained +
+//!             buffer index, so scrollback eviction never rewinds them
+//!   raw     — pane_read also returns data_hex (exact bytes); data stays
+//!             lossy UTF-8 for human eyes
+//!   DSR     — pane_attach/pane_detach: while attached, the server stops
+//!             answering ESC[6n so the attach client's real terminal
+//!             replies with true cursor coordinates (full-screen apps
+//!             render correctly); detach restores the headless 1;1 reply
 
 // release = background daemon (no console window); debug keeps one
 #![cfg_attr(
@@ -41,7 +51,7 @@ use rmcp::handler::server::wrapper::Json;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{schemars, tool, tool_router, ErrorData};
+use rmcp::{ErrorData, schemars, tool, tool_router};
 
 const BIND_ADDRESS: &str = "0.0.0.0:9881";
 const SCROLLBACK_CAP: usize = 4 * 1024 * 1024;
@@ -71,7 +81,11 @@ struct Pane {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send + Sync>,
     buffer: Arc<Mutex<Vec<u8>>>,
+    /// bytes dropped from the buffer front; absolute cursor = drained + index
+    drained: Arc<Mutex<u64>>,
     last_write: Arc<Mutex<Instant>>,
+    /// an attach client owns the DSR conversation while true
+    attached: Arc<Mutex<bool>>,
 }
 
 #[derive(Clone, Default)]
@@ -139,10 +153,14 @@ impl Workbench {
                 .map_err(|e| err_internal(&format!("pty writer: {e}")))?,
         ));
         let buffer = Arc::new(Mutex::new(Vec::new()));
+        let drained = Arc::new(Mutex::new(0u64));
         let last_write = Arc::new(Mutex::new(Instant::now()));
+        let attached = Arc::new(Mutex::new(false));
         let buf = Arc::clone(&buffer);
         let lw = Arc::clone(&last_write);
         let wreply = Arc::clone(&writer);
+        let drn = Arc::clone(&drained);
+        let att = Arc::clone(&attached);
         std::thread::spawn(move || {
             let mut reader = reader;
             let mut chunk = [0u8; 4096];
@@ -150,7 +168,11 @@ impl Workbench {
                 match reader.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if chunk[..n].windows(4).any(|w| w == b"\x1b[6n") {
+                        // DSR (cursor position query): answered here only when
+                        // no attach client owns the terminal; an attached
+                        // client's real terminal replies, so full-screen apps
+                        // get true coordinates instead of a fake 1;1.
+                        if !*att.lock().unwrap() && chunk[..n].windows(4).any(|w| w == b"\x1b[6n") {
                             let _ = wreply.lock().unwrap().write_all(b"\x1b[1;1R");
                         }
                         *lw.lock().unwrap() = Instant::now();
@@ -158,7 +180,9 @@ impl Workbench {
                         b.extend_from_slice(&chunk[..n]);
                         let len = b.len();
                         if len > SCROLLBACK_CAP {
-                            b.drain(..len - SCROLLBACK_CAP);
+                            let drop_n = len - SCROLLBACK_CAP;
+                            b.drain(..drop_n);
+                            *drn.lock().unwrap() += drop_n as u64;
                         }
                     }
                 }
@@ -177,14 +201,16 @@ impl Workbench {
                 writer,
                 child,
                 buffer,
+                drained,
                 last_write,
+                attached,
             })),
         );
         Ok(Json(serde_json::json!({ "id": id, "shell": SHELL })))
     }
 
     #[tool(
-        description = "Read new pane output since your cursor. Returns {data, cursor, alive}: advance your cursor to the returned one; alive=false means the shell exited"
+        description = "Read new pane output since your cursor. Returns {data, data_hex, cursor, alive}: advance your cursor to the returned one (monotonic, never rewinds); data_hex is the exact raw bytes (data is lossy UTF-8); alive=false means the shell exited"
     )]
     fn pane_read(
         &self,
@@ -200,12 +226,27 @@ impl Workbench {
         let mut p = pane.lock().unwrap();
         let (chunk, cursor) = {
             let buf = p.buffer.lock().unwrap();
-            let at = args.cursor.min(buf.len());
-            (buf[at..].to_vec(), buf.len())
+            let drained = *p.drained.lock().unwrap();
+            // absolute cursor space: drained + index; a cursor older than the
+            // drained prefix clamps to the oldest surviving byte
+            let at = if args.cursor >= drained {
+                ((args.cursor - drained) as usize).min(buf.len())
+            } else {
+                0
+            };
+            let cap = args.max_bytes.map(|m| m as usize).unwrap_or(buf.len());
+            let end = (at + cap).min(buf.len());
+            (buf[at..end].to_vec(), drained + end as u64)
         };
         let alive = p.child.try_wait().map(|w| w.is_none()).unwrap_or(false);
+        let mut hex = String::with_capacity(chunk.len() * 2);
+        for b in &chunk {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
         Ok(Json(serde_json::json!({
             "data": String::from_utf8_lossy(&chunk),
+            "data_hex": hex,
             "cursor": cursor,
             "alive": alive,
         })))
@@ -243,7 +284,7 @@ impl Workbench {
             .get(&args.id)
             .cloned()
             .ok_or_else(|| err_invalid(&format!("no pane {}", args.id)))?;
-        let mut p = pane.lock().unwrap();
+        let p = pane.lock().unwrap();
         p.master
             .resize(PtySize {
                 rows: args.rows,
@@ -273,13 +314,55 @@ impl Workbench {
             .ok_or_else(|| err_invalid(&format!("no pane {}", args.id)))?;
         let mut p = pane.lock().unwrap();
         let buf_len = p.buffer.lock().unwrap().len();
+        let drained = *p.drained.lock().unwrap();
         let idle_ms = p.last_write.lock().unwrap().elapsed().as_millis() as u64;
         let alive = p.child.try_wait().map(|w| w.is_none()).unwrap_or(false);
+        let attached = *p.attached.lock().unwrap();
         Ok(Json(serde_json::json!({
             "alive": alive,
             "buffer_len": buf_len,
+            "cursor": drained + buf_len as u64,
             "idle_ms": idle_ms,
+            "attached": attached,
         })))
+    }
+
+    #[tool(
+        description = "Mark a pane as attached by a raw-terminal client: the server stops answering DSR cursor queries (the client's real terminal answers them) and pane_status reports attached=true. Call pane_detach on exit so fire-and-forget shells get DSR replies back"
+    )]
+    fn pane_attach(
+        &self,
+        Parameters(args): Parameters<PaneIdArgs>,
+    ) -> Result<Json<serde_json::Value>, ErrorData> {
+        let pane = self
+            .panes
+            .lock()
+            .unwrap()
+            .get(&args.id)
+            .cloned()
+            .ok_or_else(|| err_invalid(&format!("no pane {}", args.id)))?;
+        let p = pane.lock().unwrap();
+        *p.attached.lock().unwrap() = true;
+        Ok(Json(serde_json::json!({ "attached": args.id })))
+    }
+
+    #[tool(
+        description = "Unmark a pane's attached state: the server resumes answering DSR cursor queries for headless fire-and-forget shells"
+    )]
+    fn pane_detach(
+        &self,
+        Parameters(args): Parameters<PaneIdArgs>,
+    ) -> Result<Json<serde_json::Value>, ErrorData> {
+        let pane = self
+            .panes
+            .lock()
+            .unwrap()
+            .get(&args.id)
+            .cloned()
+            .ok_or_else(|| err_invalid(&format!("no pane {}", args.id)))?;
+        let p = pane.lock().unwrap();
+        *p.attached.lock().unwrap() = false;
+        Ok(Json(serde_json::json!({ "detached": args.id })))
     }
 
     #[tool(description = "Kill a pane's shell and drop it from the registry")]
@@ -359,10 +442,14 @@ impl Workbench {
                         .map_err(|e| err_internal(&format!("pty writer: {e}")))?,
                 ));
                 let buffer = Arc::new(Mutex::new(Vec::new()));
+                let drained = Arc::new(Mutex::new(0u64));
                 let last_write = Arc::new(Mutex::new(Instant::now()));
+                let attached = Arc::new(Mutex::new(false));
                 let buf = Arc::clone(&buffer);
                 let lw = Arc::clone(&last_write);
                 let wreply = Arc::clone(&writer);
+                let drn = Arc::clone(&drained);
+                let att = Arc::clone(&attached);
                 std::thread::spawn(move || {
                     let mut reader = reader;
                     let mut chunk = [0u8; 4096];
@@ -370,7 +457,9 @@ impl Workbench {
                         match reader.read(&mut chunk) {
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
-                                if chunk[..n].windows(4).any(|w| w == b"[6n") {
+                                if !*att.lock().unwrap()
+                                    && chunk[..n].windows(4).any(|w| w == b"[6n")
+                                {
                                     let _ = wreply.lock().unwrap().write_all(b"[1;1R");
                                 }
                                 *lw.lock().unwrap() = Instant::now();
@@ -378,7 +467,9 @@ impl Workbench {
                                 b.extend_from_slice(&chunk[..n]);
                                 let len = b.len();
                                 if len > SCROLLBACK_CAP {
-                                    b.drain(..len - SCROLLBACK_CAP);
+                                    let drop_n = len - SCROLLBACK_CAP;
+                                    b.drain(..drop_n);
+                                    *drn.lock().unwrap() += drop_n as u64;
                                 }
                             }
                         }
@@ -389,7 +480,9 @@ impl Workbench {
                     writer,
                     child,
                     buffer,
+                    drained,
                     last_write,
+                    attached,
                 }));
                 self.panes.lock().unwrap().insert(0, Arc::clone(&pane));
                 pane
@@ -694,6 +787,23 @@ where
     }
 }
 
+fn de_u64_req_from_string_or_int<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        Int(u64),
+        Str(String),
+    }
+    match V::deserialize(deserializer)? {
+        V::Int(n) => Ok(n),
+        V::Str(s) => s.parse::<u64>().map_err(serde::de::Error::custom),
+    }
+}
+
 fn de_u32_from_string_or_int<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -729,9 +839,12 @@ struct PaneReadArgs {
     /// Pane id from pane_open
     #[serde(deserialize_with = "de_u32_from_string_or_int")]
     pub id: u32,
-    /// Your cursor from the last pane_read (start at 0)
-    #[serde(default)]
-    pub cursor: usize,
+    /// Your cursor from the last pane_read (start at 0; monotonic)
+    #[serde(default, deserialize_with = "de_u64_req_from_string_or_int")]
+    pub cursor: u64,
+    /// Cap on bytes returned this call (replay drains in chunks; 0 = all)
+    #[serde(default, deserialize_with = "de_u64_from_string_or_int")]
+    pub max_bytes: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -759,6 +872,13 @@ struct PaneResizeArgs {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PaneStatusArgs {
     /// Pane id
+    pub id: u32,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PaneIdArgs {
+    /// Pane id
+    #[serde(deserialize_with = "de_u32_from_string_or_int")]
     pub id: u32,
 }
 
@@ -877,7 +997,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
-    eprintln!("vmi-mcp v0.2 listening on http://{BIND_ADDRESS}/mcp");
+    eprintln!("vmi-mcp v0.5 listening on http://{BIND_ADDRESS}/mcp");
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;

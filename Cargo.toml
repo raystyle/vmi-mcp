@@ -1,6 +1,6 @@
 [package]
 name = "vmi-mcp"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 description = "User-level MCP workbench for Windows VMs (guest side: born in the interactive session (the only legal birth canal for visible windows), spoken to over loopback streamable-HTTP from any session"
 license = "MIT"
@@ -10,9 +10,11 @@ rmcp = { version = "3", features = [
     "server",
     "macros",
     "transport-streamable-http-server",
+    "client",
+    "transport-streamable-http-client-reqwest",
     "schemars",
 ] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-std", "time"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,6 +23,17 @@ axum = "0.8"
 portable-pty = "0.9"
 local-ip-address = "0.6"
 schemars = "1.0"
+crossterm = "0.28"
+reqwest = { version = "0.13", default-features = false }
+
+# vmi-attach: raw-terminal attach client; vmi-mcp: the daemon itself
+[[bin]]
+name = "vmi-mcp"
+path = "src/main.rs"
+
+[[bin]]
+name = "vmi-attach"
+path = "src/attach.rs"
 
 # static CRT: build with RUSTFLAGS="-C target-feature=+crt-static"
 [profile.release]
