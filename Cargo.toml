@@ -1,6 +1,6 @@
 [package]
 name = "vmi-mcp"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 description = "User-level MCP workbench for Windows VMs (guest side: born in the interactive session (the only legal birth canal for visible windows), spoken to over loopback streamable-HTTP from any session"
 license = "MIT"

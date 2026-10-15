@@ -35,7 +35,7 @@ use rmcp::transport::{
 };
 use serde_json::{json, Value};
 use tokio_stream::StreamExt;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 type Client = RunningService<RoleClient, ClientConfig>;
 
@@ -673,6 +673,8 @@ fn ansi256(n: u16) -> Color {
 
 struct Pane {
     id: u32,
+    /// pane age in seconds per the last pane_list sync (server truth)
+    age_s: u64,
     cursor: u64,
     parser: vte::Parser,
     screen: Screen,
@@ -685,6 +687,7 @@ impl Pane {
     fn new(id: u32, rows: usize, cols: usize) -> Self {
         Self {
             id,
+            age_s: 0,
             cursor: 0,
             parser: vte::Parser::new(),
             screen: Screen::new(rows, cols),
@@ -791,7 +794,14 @@ fn key_to_ansi(
 // UI
 // ---------------------------------------------------------------------------
 
-fn draw(f: &mut Frame, panes: &[Pane], focus: usize, ctx: &UiCtx) {
+/// Mouse hit geometry refreshed by the last draw.
+#[derive(Default)]
+struct Hits {
+    chip_hits: Vec<(u16, u16)>,
+    chips_y: u16,
+}
+
+fn draw(f: &mut Frame, panes: &[Pane], focus: usize, ctx: &UiCtx, hits: &mut Hits) {
     let area = f.area();
     // shell grid fills the screen; separator; 3-row status block
     // (panes + endpoint / title + session + user / key help)
@@ -808,7 +818,11 @@ fn draw(f: &mut Frame, panes: &[Pane], focus: usize, ctx: &UiCtx) {
         f.render_widget(Paragraph::new("no panes - Ctrl-B c to open"), rows[0]);
     }
     f.render_widget(separator(width_of(&rows[1])), rows[1]);
-    f.render_widget(Paragraph::new(status_lines(panes, focus, ctx)), rows[2]);
+    let status = status_lines(panes, focus, ctx);
+    let status_rows = rows[2];
+    f.render_widget(Paragraph::new(status.lines), status_rows);
+    hits.chip_hits = status.chip_hits;
+    hits.chips_y = status_rows.y;
 }
 
 fn width_of(r: &Rect) -> usize {
@@ -840,7 +854,14 @@ fn render_grid(f: &mut Frame, area: Rect, p: &Pane) {
     }
 }
 
-fn status_lines(panes: &[Pane], focus: usize, ctx: &UiCtx) -> Vec<Line<'static>> {
+/// Rendered status block plus chip hit regions (column ranges on the
+/// chips row, index-aligned with `panes`) for mouse clicks.
+struct StatusRender {
+    lines: Vec<Line<'static>>,
+    chip_hits: Vec<(u16, u16)>, // (start_col, end_col) per pane chip
+}
+
+fn status_lines(panes: &[Pane], focus: usize, ctx: &UiCtx) -> StatusRender {
     // row 1: brand + pane chips (focus mark, alive, idle) + endpoint
     let mut chips = vec![Span::styled(
         " vmi-tui ".to_string(),
@@ -849,19 +870,28 @@ fn status_lines(panes: &[Pane], focus: usize, ctx: &UiCtx) -> Vec<Line<'static>>
     if panes.is_empty() {
         chips.push(Span::raw("no panes"));
     }
+    let mut chip_hits = Vec::new();
+    let mut col: u16 = " vmi-tui ".len() as u16;
     for (i, p) in panes.iter().enumerate() {
         let mark = if i == focus { "▶" } else { "" };
+        // pane age from the server beats a fake idle counter; the two
+        // terminal states outrank age
         let state = if !p.alive {
-            "已退出".to_string()
+            "[已退出]".to_string()
+        } else if p.screen.on_alt {
+            "[全屏]".to_string()
         } else {
-            format!("空闲{}s", p.last_output.elapsed().as_secs())
+            format!("[{}s]", p.age_s)
         };
-        let txt = format!("{mark}面板{}[{state}] ", p.id);
+        let txt = format!("{mark}面板{}{state} ", p.id);
         let style = if i == focus {
             Style::new().fg(Color::Black).bg(Color::Green)
         } else {
             Style::new().fg(Color::Gray)
         };
+        let w = txt.width() as u16;
+        chip_hits.push((col, col + w.saturating_sub(1)));
+        col += w;
         chips.push(Span::styled(txt, style));
     }
     // row 2: remote window title (cmd's "管理员: " prefix stripped) |
@@ -873,7 +903,7 @@ fn status_lines(panes: &[Pane], focus: usize, ctx: &UiCtx) -> Vec<Line<'static>>
         .map(|t| t.trim_start_matches("管理员: ").trim().to_string())
         .unwrap_or_else(|| "-".to_string());
     // row 3: endpoint on its own line + short key help
-    vec![
+    let lines = vec![
         Line::from(chips),
         Line::from(vec![
             Span::styled(format!(" {title} "), Style::new().fg(Color::Cyan)),
@@ -883,16 +913,14 @@ fn status_lines(panes: &[Pane], focus: usize, ctx: &UiCtx) -> Vec<Line<'static>>
             ),
         ]),
         Line::from(vec![
-            Span::styled(
-                format!(" {}", ctx.url),
-                Style::new().fg(Color::DarkGray),
-            ),
+            Span::styled(format!(" {}", ctx.url), Style::new().fg(Color::DarkGray)),
             Span::styled(
                 "  Ctrl-B: n/p c x q".to_string(),
                 Style::new().fg(Color::DarkGray),
             ),
         ]),
-    ]
+    ];
+    StatusRender { lines, chip_hits }
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,9 +1043,11 @@ async fn main() -> Result<()> {
     // TUI owns the terminal: alt screen + raw mode, restored on drop
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    crossterm::execute!(stdout, crossterm::event::EnableMouseCapture)?;
     crossterm::terminal::enable_raw_mode()?;
     let tui_result = tui_run(&svc, &mut panes, &mut focus, &ctx, cols, rows).await;
     crossterm::terminal::disable_raw_mode()?;
+    crossterm::execute!(stdout, crossterm::event::DisableMouseCapture)?;
     crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen)?;
     tui_result
 }
@@ -1038,6 +1068,8 @@ async fn tui_run(
     // would drop a keystroke already pulled from the queue (seen live:
     // trailing chars of send-text bursts vanished). Pump events through
     // a dedicated task into an mpsc channel; recv() is cancel-safe.
+    let mut hits = Hits::default();
+    let mut last_scan = Instant::now();
     let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut events = crossterm::event::EventStream::new();
@@ -1064,6 +1096,66 @@ async fn tui_run(
     }
 
     loop {
+        // ---- pane registry sync (fire-and-forget `shell` creates pane 0
+        // behind our back; external pane_kill removes panes) ----
+        if last_scan.elapsed() > Duration::from_secs(1) {
+            last_scan = Instant::now();
+            if let Ok(v) = call(svc, "pane_list", obj(json!({}))).await {
+                let ids: Vec<u32> = v
+                    .get("panes")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.get("id").and_then(Value::as_u64).map(|i| i as u32))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let gone: Vec<u32> = panes
+                    .iter()
+                    .map(|p| p.id)
+                    .filter(|id| !ids.contains(id))
+                    .collect();
+                for id in gone {
+                    panes.retain(|p| p.id != id);
+                }
+                let ages: Vec<(u32, u64)> = v
+                    .get("panes")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| {
+                                Some((
+                                    x.get("id").and_then(Value::as_u64)? as u32,
+                                    x.get("age_s").and_then(Value::as_u64).unwrap_or(0),
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for id in ids {
+                    if let Some(p) = panes.iter_mut().find(|p| p.id == id) {
+                        if let Some((_, age)) = ages.iter().find(|(i, _)| *i == id) {
+                            p.age_s = *age;
+                        }
+                    } else {
+                        let (r, c) = (need_resize.0, need_resize.1);
+                        let mut np = Pane::new(id, r.max(2), c.max(8));
+                        if let Some((_, age)) = ages.iter().find(|(i, _)| *i == id) {
+                            np.age_s = *age;
+                        }
+                        panes.push(np);
+                    }
+                }
+                if *focus >= panes.len() {
+                    *focus = panes.len().saturating_sub(1);
+                    if let Some(p) = panes.get(*focus) {
+                        let _ = call(svc, "pane_attach", obj(json!({ "id": p.id }))).await;
+                        panes[*focus].attached = true;
+                    }
+                }
+            }
+        }
+
         // ---- poll panes ----
         for i in 0..panes.len() {
             let id = panes[i].id;
@@ -1096,7 +1188,7 @@ async fn tui_run(
         }
 
         // ---- draw ----
-        terminal.draw(|f| draw(f, panes, *focus, ctx))?;
+        terminal.draw(|f| draw(f, panes, *focus, ctx, &mut hits))?;
 
         // ---- input / tick ----
         let ev = tokio::select! {
@@ -1188,6 +1280,21 @@ async fn tui_run(
                     if let Some(p) = panes.get(*focus) {
                         let _ =
                             call(svc, "pane_send", obj(json!({ "id": p.id, "text": text }))).await;
+                    }
+                }
+            }
+            crossterm::event::Event::Mouse(m) => {
+                if let crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) =
+                    m.kind
+                {
+                    if m.row == hits.chips_y {
+                        if let Some(idx) = hits
+                            .chip_hits
+                            .iter()
+                            .position(|(a, b)| m.column >= *a && m.column <= *b)
+                        {
+                            switch_focus(svc, panes, focus, idx).await;
+                        }
                     }
                 }
             }

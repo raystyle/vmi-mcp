@@ -86,6 +86,8 @@ struct Pane {
     last_write: Arc<Mutex<Instant>>,
     /// an attach client owns the DSR conversation while true
     attached: Arc<Mutex<bool>>,
+    /// pane birth moment (age reported through pane_list)
+    created: Instant,
 }
 
 #[derive(Clone, Default)]
@@ -105,7 +107,9 @@ impl Workbench {
         }
     }
 
-    #[tool(description = "Workbench heartbeat: pid, session id, session name, user, uptime, open panes")]
+    #[tool(
+        description = "Workbench heartbeat: pid, session id, session name, user, uptime, open panes"
+    )]
     fn status(&self) -> Json<serde_json::Value> {
         let panes = self.panes.lock().unwrap().len();
         Json(serde_json::json!({
@@ -205,6 +209,7 @@ impl Workbench {
                 drained,
                 last_write,
                 attached,
+                created: Instant::now(),
             })),
         );
         Ok(Json(serde_json::json!({ "id": id, "shell": SHELL })))
@@ -318,6 +323,7 @@ impl Workbench {
                     "cursor": drained + buf_len as u64,
                     "idle_ms": idle_ms,
                     "attached": attached,
+                    "age_s": p.created.elapsed().as_secs(),
                 })
             })
             .collect();
@@ -509,6 +515,7 @@ impl Workbench {
                     drained,
                     last_write,
                     attached,
+                    created: Instant::now(),
                 }));
                 self.panes.lock().unwrap().insert(0, Arc::clone(&pane));
                 pane
@@ -1044,7 +1051,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
-    eprintln!("vmi-mcp v0.6.2 listening on http://{BIND_ADDRESS}/mcp");
+    eprintln!("vmi-mcp v0.6.3 listening on http://{BIND_ADDRESS}/mcp");
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
