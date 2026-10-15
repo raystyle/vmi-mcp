@@ -785,16 +785,18 @@ fn key_to_ansi(
 
 fn draw(f: &mut Frame, panes: &[Pane], focus: usize, url: &str) {
     let area = f.area();
-    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    // two status rows: panes+title on top, url+keys below (a single row
+    // overflows a narrow split)
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(area);
     let main = chunks[0];
     let bar = chunks[1];
 
     if let Some(p) = panes.get(focus) {
         render_grid(f, main, p);
     } else {
-        f.render_widget(Paragraph::new("no panes — Ctrl-B c to open"), main);
+        f.render_widget(Paragraph::new("no panes - Ctrl-B c to open"), main);
     }
-    f.render_widget(status_line(panes, focus, url), bar);
+    f.render_widget(Paragraph::new(status_lines(panes, focus, url)), bar);
 }
 
 fn render_grid(f: &mut Frame, area: Rect, p: &Pane) {
@@ -817,13 +819,14 @@ fn render_grid(f: &mut Frame, area: Rect, p: &Pane) {
     }
 }
 
-fn status_line(panes: &[Pane], focus: usize, url: &str) -> Line<'static> {
-    let mut spans = vec![Span::styled(
+fn status_lines(panes: &[Pane], focus: usize, url: &str) -> Vec<Line<'static>> {
+    // row 1: brand + pane chips + remote window title
+    let mut top = vec![Span::styled(
         " vmi-tui ".to_string(),
         Style::new().fg(Color::Black).bg(Color::Cyan),
     )];
     if panes.is_empty() {
-        spans.push(Span::raw("no panes"));
+        top.push(Span::raw("no panes"));
     }
     for (i, p) in panes.iter().enumerate() {
         let mark = if i == focus { '*' } else { ' ' };
@@ -835,20 +838,24 @@ fn status_line(panes: &[Pane], focus: usize, url: &str) -> Line<'static> {
         } else {
             Style::new().fg(Color::Gray)
         };
-        spans.push(Span::styled(txt, style));
+        top.push(Span::styled(txt, style));
     }
     let title = panes
         .get(focus)
         .map(|p| p.screen.title.clone())
         .filter(|t| !t.is_empty())
         .unwrap_or_default();
-    let help = " Ctrl-B: n/p next/prev, c open, x kill, 0-9 jump, q quit ";
-    spans.push(Span::raw(format!(" {title} | {url} ")));
-    spans.push(Span::styled(
-        help.to_string(),
-        Style::new().fg(Color::DarkGray),
-    ));
-    Line::from(spans)
+
+    // row 2: endpoint + key help
+    let bottom = vec![
+        Span::styled(format!(" {title} "), Style::new().fg(Color::Cyan)),
+        Span::raw(url.to_string()),
+        Span::styled(
+            "  Ctrl-B: n/p next/prev, c open, x kill, 0-9 jump, q quit ".to_string(),
+            Style::new().fg(Color::DarkGray),
+        ),
+    ];
+    vec![Line::from(top), Line::from(bottom)]
 }
 
 // ---------------------------------------------------------------------------
