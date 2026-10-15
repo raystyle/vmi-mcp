@@ -19,7 +19,12 @@ problem.
 
 Listens on `0.0.0.0:9881`, MCP endpoint `/mcp` (streamable HTTP).
 Release Windows builds are static-CRT and windowless (background
-daemon). Any MCP client works; mcp2cli face:
+daemon).
+
+Any MCP client works. The CLI face is
+[mcp2cli](https://github.com/mcp2cli/source-code) (Rust; upstream
+targets unix, Windows builds need the cfg gates we carry in
+hvperv-harness):
 
 ```
 mcp2cli --url http://<guest-ip>:9881/mcp ls
