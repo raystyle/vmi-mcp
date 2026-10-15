@@ -518,22 +518,60 @@ fn cleanup0(bat: &str, outfile: &str, donefile: &str) {
     let _ = std::fs::remove_file(donefile);
 }
 
+fn de_u16_from_string_or_int<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        Int(u16),
+        Str(String),
+        Null,
+    }
+    match Option::<V>::deserialize(deserializer)? {
+        None | Some(V::Null) => Ok(None),
+        Some(V::Int(n)) => Ok(Some(n)),
+        Some(V::Str(s)) if s.is_empty() || s == "null" => Ok(None),
+        Some(V::Str(s)) => s.parse::<u16>().map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+fn de_u32_from_string_or_int<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        Int(u32),
+        Str(String),
+    }
+    match V::deserialize(deserializer)? {
+        V::Int(n) => Ok(n),
+        V::Str(s) => s.parse::<u32>().map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PaneOpenArgs {
     /// Working directory for the shell (optional)
     #[serde(default)]
     pub cwd: Option<String>,
     /// Terminal columns (default 80)
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_u16_from_string_or_int")]
     pub cols: Option<u16>,
     /// Terminal rows (default 24)
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_u16_from_string_or_int")]
     pub rows: Option<u16>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PaneReadArgs {
     /// Pane id from pane_open
+    #[serde(deserialize_with = "de_u32_from_string_or_int")]
     pub id: u32,
     /// Your cursor from the last pane_read (start at 0)
     #[serde(default)]
@@ -543,6 +581,7 @@ struct PaneReadArgs {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PaneSendArgs {
     /// Pane id
+    #[serde(deserialize_with = "de_u32_from_string_or_int")]
     pub id: u32,
     /// Text to type; append \r for Enter
     pub text: String,
@@ -551,16 +590,20 @@ struct PaneSendArgs {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PaneResizeArgs {
     /// Pane id
+    #[serde(deserialize_with = "de_u32_from_string_or_int")]
     pub id: u32,
     /// New columns
+    #[serde(deserialize_with = "de_u16_from_string_or_int")]
     pub cols: u16,
     /// New rows
+    #[serde(deserialize_with = "de_u16_from_string_or_int")]
     pub rows: u16,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PaneKillArgs {
     /// Pane id
+    #[serde(deserialize_with = "de_u32_from_string_or_int")]
     pub id: u32,
 }
 
