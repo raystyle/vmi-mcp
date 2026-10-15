@@ -711,8 +711,19 @@ async fn main() -> anyhow::Result<()> {
     let config = StreamableHttpServerConfig::default()
         .with_cancellation_token(ct.child_token())
         .with_allowed_hosts(hosts);
+    // one process-wide workbench state: panes must survive across MCP
+    // sessions (cursor-based multiplexing is multi-client by design)
+    let panes: Arc<Mutex<HashMap<u32, Arc<Mutex<Pane>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let next_id: Arc<Mutex<u32>> = Arc::new(Mutex::new(1));
+    let started = Instant::now();
     let service = StreamableHttpService::new(
-        || Ok(Workbench::new()),
+        move || {
+            Ok(Workbench {
+                started: Some(started),
+                panes: Arc::clone(&panes),
+                next_id: Arc::clone(&next_id),
+            })
+        },
         LocalSessionManager::default().into(),
         config,
     );
