@@ -68,9 +68,10 @@ fn err_internal(msg: &str) -> ErrorData {
 
 struct Pane {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send + Sync>,
     buffer: Arc<Mutex<Vec<u8>>>,
+    last_write: Arc<Mutex<Instant>>,
 }
 
 #[derive(Clone, Default)]
@@ -132,12 +133,16 @@ impl Workbench {
             .master
             .try_clone_reader()
             .map_err(|e| err_internal(&format!("pty reader: {e}")))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| err_internal(&format!("pty writer: {e}")))?;
+        let writer = Arc::new(Mutex::new(
+            pair.master
+                .take_writer()
+                .map_err(|e| err_internal(&format!("pty writer: {e}")))?,
+        ));
         let buffer = Arc::new(Mutex::new(Vec::new()));
+        let last_write = Arc::new(Mutex::new(Instant::now()));
         let buf = Arc::clone(&buffer);
+        let lw = Arc::clone(&last_write);
+        let wreply = Arc::clone(&writer);
         std::thread::spawn(move || {
             let mut reader = reader;
             let mut chunk = [0u8; 4096];
@@ -145,6 +150,10 @@ impl Workbench {
                 match reader.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        if chunk[..n].windows(4).any(|w| w == b"\x1b[6n") {
+                            let _ = wreply.lock().unwrap().write_all(b"\x1b[1;1R");
+                        }
+                        *lw.lock().unwrap() = Instant::now();
                         let mut b = buf.lock().unwrap();
                         b.extend_from_slice(&chunk[..n]);
                         let len = b.len();
@@ -168,6 +177,7 @@ impl Workbench {
                 writer,
                 child,
                 buffer,
+                last_write,
             })),
         );
         Ok(Json(serde_json::json!({ "id": id, "shell": SHELL })))
@@ -213,10 +223,10 @@ impl Workbench {
             .get(&args.id)
             .cloned()
             .ok_or_else(|| err_invalid(&format!("no pane {}", args.id)))?;
-        let mut p = pane.lock().unwrap();
-        p.writer
-            .write_all(args.text.as_bytes())
-            .and_then(|_| p.writer.flush())
+        let p = pane.lock().unwrap();
+        let mut w = p.writer.lock().unwrap();
+        w.write_all(args.text.as_bytes())
+            .and_then(|_| w.flush())
             .map_err(|e| err_internal(&format!("write: {e}")))?;
         Ok(Json(serde_json::json!({ "sent": args.text.len() })))
     }
@@ -245,6 +255,31 @@ impl Workbench {
         Ok(Json(
             serde_json::json!({ "resized": [args.cols, args.rows] }),
         ))
+    }
+
+    #[tool(
+        description = "Buffer/idle state of a pane: alive, buffer_len, idle_ms since last output. Stable idle_ms = command finished; growing buffer = still running"
+    )]
+    fn pane_status(
+        &self,
+        Parameters(args): Parameters<PaneStatusArgs>,
+    ) -> Result<Json<serde_json::Value>, ErrorData> {
+        let pane = self
+            .panes
+            .lock()
+            .unwrap()
+            .get(&args.id)
+            .cloned()
+            .ok_or_else(|| err_invalid(&format!("no pane {}", args.id)))?;
+        let mut p = pane.lock().unwrap();
+        let buf_len = p.buffer.lock().unwrap().len();
+        let idle_ms = p.last_write.lock().unwrap().elapsed().as_millis() as u64;
+        let alive = p.child.try_wait().map(|w| w.is_none()).unwrap_or(false);
+        Ok(Json(serde_json::json!({
+            "alive": alive,
+            "buffer_len": buf_len,
+            "idle_ms": idle_ms,
+        })))
     }
 
     #[tool(description = "Kill a pane's shell and drop it from the registry")]
@@ -318,12 +353,16 @@ impl Workbench {
                     .master
                     .try_clone_reader()
                     .map_err(|e| err_internal(&format!("pty reader: {e}")))?;
-                let writer = pair
-                    .master
-                    .take_writer()
-                    .map_err(|e| err_internal(&format!("pty writer: {e}")))?;
+                let writer = Arc::new(Mutex::new(
+                    pair.master
+                        .take_writer()
+                        .map_err(|e| err_internal(&format!("pty writer: {e}")))?,
+                ));
                 let buffer = Arc::new(Mutex::new(Vec::new()));
+                let last_write = Arc::new(Mutex::new(Instant::now()));
                 let buf = Arc::clone(&buffer);
+                let lw = Arc::clone(&last_write);
+                let wreply = Arc::clone(&writer);
                 std::thread::spawn(move || {
                     let mut reader = reader;
                     let mut chunk = [0u8; 4096];
@@ -331,6 +370,10 @@ impl Workbench {
                         match reader.read(&mut chunk) {
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
+                                if chunk[..n].windows(4).any(|w| w == b"[6n") {
+                                    let _ = wreply.lock().unwrap().write_all(b"[1;1R");
+                                }
+                                *lw.lock().unwrap() = Instant::now();
                                 let mut b = buf.lock().unwrap();
                                 b.extend_from_slice(&chunk[..n]);
                                 let len = b.len();
@@ -346,19 +389,17 @@ impl Workbench {
                     writer,
                     child,
                     buffer,
+                    last_write,
                 }));
                 self.panes.lock().unwrap().insert(0, Arc::clone(&pane));
                 pane
             }
         };
-        let text = format!(
-            "{cmd}
-"
-        );
-        let mut p = pane.lock().unwrap();
-        p.writer
-            .write_all(text.as_bytes())
-            .and_then(|_| p.writer.flush())
+        let text = format!("{cmd}\r");
+        let p = pane.lock().unwrap();
+        let mut w = p.writer.lock().unwrap();
+        w.write_all(text.as_bytes())
+            .and_then(|_| w.flush())
             .map_err(|e| err_internal(&format!("write: {e}")))?;
         Ok(Json(serde_json::json!({ "fired": true, "pane": 0 })))
     }
@@ -713,6 +754,12 @@ struct PaneResizeArgs {
     /// New rows
     #[serde(deserialize_with = "de_u16_req_from_string_or_int")]
     pub rows: u16,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PaneStatusArgs {
+    /// Pane id
+    pub id: u32,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
