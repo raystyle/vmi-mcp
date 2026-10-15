@@ -51,7 +51,7 @@ use rmcp::handler::server::wrapper::Json;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{ErrorData, schemars, tool, tool_router};
+use rmcp::{schemars, tool, tool_router, ErrorData};
 
 const BIND_ADDRESS: &str = "0.0.0.0:9881";
 const SCROLLBACK_CAP: usize = 4 * 1024 * 1024;
@@ -296,6 +296,31 @@ impl Workbench {
         Ok(Json(
             serde_json::json!({ "resized": [args.cols, args.rows] }),
         ))
+    }
+
+    #[tool(description = "List open panes: [{id, alive, buffer_len, cursor, idle_ms, attached}]")]
+    fn pane_list(&self) -> Json<serde_json::Value> {
+        let panes = self.panes.lock().unwrap();
+        let list: Vec<serde_json::Value> = panes
+            .iter()
+            .map(|(id, pane)| {
+                let mut p = pane.lock().unwrap();
+                let buf_len = p.buffer.lock().unwrap().len();
+                let drained = *p.drained.lock().unwrap();
+                let idle_ms = p.last_write.lock().unwrap().elapsed().as_millis() as u64;
+                let alive = p.child.try_wait().map(|w| w.is_none()).unwrap_or(false);
+                let attached = *p.attached.lock().unwrap();
+                serde_json::json!({
+                    "id": id,
+                    "alive": alive,
+                    "buffer_len": buf_len,
+                    "cursor": drained + buf_len as u64,
+                    "idle_ms": idle_ms,
+                    "attached": attached,
+                })
+            })
+            .collect();
+        Json(serde_json::json!({ "panes": list }))
     }
 
     #[tool(
@@ -997,7 +1022,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
-    eprintln!("vmi-mcp v0.5 listening on http://{BIND_ADDRESS}/mcp");
+    eprintln!("vmi-mcp v0.6 listening on http://{BIND_ADDRESS}/mcp");
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;

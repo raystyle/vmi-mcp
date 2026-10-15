@@ -17,13 +17,13 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use rmcp::model::{CallToolRequestParams, ClientConfig, JsonObject};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use rmcp::transport::{
-    StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+    streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 
 /// CLI: vmi-attach [--url http://ip:9881/mcp] [--pane 0]

@@ -8,11 +8,12 @@ user's DPAPI secrets), spoken to over streamable-HTTP from any session.
 One daemon, one command face, session 0/1 stops being the caller's
 problem.
 
-## Tools v0.5
+## Tools v0.6
 
 | tool | what |
 | --- | --- |
 | `pane_open` / `pane_read` / `pane_send` / `pane_resize` / `pane_kill` | long-lived shell panes (ConPTY on Windows, pty on Linux/macOS; cursor-based multiplexed read + send; cursors are monotonic, `data_hex` carries exact raw bytes) |
+| `pane_list` | enumerate open panes with alive/cursor/idle/attached |
 | `pane_status` | buffer/idle heartbeat: `alive`, `buffer_len`, `idle_ms`, `attached`; stable idle means the command finished |
 | `pane_attach` / `pane_detach` | raw-terminal attach mode: the server stops answering DSR cursor queries so the attach client's real terminal replies (full-screen apps render correctly); detach restores headless replies |
 | `shell` | fire-and-forget into pane 0 by default (tmux semantics: fire, poll `pane_read`); `wait=true` blocks with captured output; Windows `session=0` headless SYSTEM via the passwordless schtasks channel |
@@ -27,6 +28,20 @@ real terminal. Detach with `Ctrl-B q` (herdr convention).
 
 ```
 vmi-attach --url http://<guest-ip>:9881/mcp --pane 0
+```
+
+## vmi-tui
+
+The pane-switching TUI: one focused pane fills the screen, a status
+bar lists every pane (focus mark, alive, idle). The VT stream is
+parsed into a per-pane grid (vte); DSR queries are answered from the
+grid state, so full-screen remote apps render correctly. Keys route
+to the focused pane through the Ctrl-B prefix (tmux-style): n/p
+next/prev, c open, x kill, 0-9 jump, q quit. `--self-test` runs a
+headless verification pass.
+
+```
+vmi-tui --url http://<guest-ip>:9881/mcp [--pane N]
 ```
 
 ## Run
@@ -58,7 +73,7 @@ path, verified on all three. GitHub Actions builds all targets on tags
 aarch64. Both binaries ship: `vmi-mcp` (daemon) and `vmi-attach`
 (attach client).
 
-## Known limits v0.5
+## Known limits v0.6
 
 - session-0 scratch files live in the system temp dir
 - kill reaches the direct child only
