@@ -264,7 +264,7 @@ impl Workbench {
     }
 
     #[tool(
-        description = "One-shot command execution with captured output. Windows: session=1 (default) runs in the interactive desktop context, session=0 runs headless as SYSTEM via a passwordless scheduled task. Other platforms run in the service context"
+        description = "Run a command. Default: fire-and-forget into the default pane 0 (returns immediately; collect with pane_read, tmux semantics). wait=true blocks with captured output. Windows session=0 runs headless as SYSTEM"
     )]
     fn shell(
         &self,
@@ -274,19 +274,93 @@ impl Workbench {
             return Err(err_invalid("cmd is required"));
         }
         let timeout = Duration::from_secs(args.timeout_s.unwrap_or(120).min(600));
-        #[cfg(windows)]
-        {
-            match args.session.unwrap_or(1) {
-                1 => run_captured(&args.cmd, timeout),
-                0 => run_session0(&args.cmd, timeout),
-                other => Err(err_invalid(&format!("session must be 0 or 1, got {other}"))),
+        let session = args.session.unwrap_or(1);
+        let wait = args.wait.unwrap_or(false);
+        if wait || session == 0 {
+            #[cfg(windows)]
+            {
+                match session {
+                    1 => run_captured(&args.cmd, timeout),
+                    0 => run_session0(&args.cmd, timeout),
+                    other => Err(err_invalid(&format!("session must be 0 or 1, got {other}"))),
+                }
             }
+            #[cfg(not(windows))]
+            {
+                let _ = session;
+                run_captured(&args.cmd, timeout)
+            }
+        } else {
+            self.shell_fire(&args.cmd)
         }
-        #[cfg(not(windows))]
-        {
-            let _ = args.session;
-            run_captured(&args.cmd, timeout)
-        }
+    }
+
+    fn shell_fire(&self, cmd: &str) -> Result<Json<serde_json::Value>, ErrorData> {
+        let pane = self.panes.lock().unwrap().get(&0).cloned();
+        let pane = match pane {
+            Some(p) => p,
+            None => {
+                let pty_system = portable_pty::native_pty_system();
+                let pair = pty_system
+                    .openpty(PtySize {
+                        rows: 24,
+                        cols: 120,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .map_err(|e| err_internal(&format!("openpty: {e}")))?;
+                let child = pair
+                    .slave
+                    .spawn_command(CommandBuilder::new(SHELL))
+                    .map_err(|e| err_internal(&format!("spawn {SHELL}: {e}")))?;
+                drop(pair.slave);
+                let reader = pair
+                    .master
+                    .try_clone_reader()
+                    .map_err(|e| err_internal(&format!("pty reader: {e}")))?;
+                let writer = pair
+                    .master
+                    .take_writer()
+                    .map_err(|e| err_internal(&format!("pty writer: {e}")))?;
+                let buffer = Arc::new(Mutex::new(Vec::new()));
+                let buf = Arc::clone(&buffer);
+                std::thread::spawn(move || {
+                    let mut reader = reader;
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match reader.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let mut b = buf.lock().unwrap();
+                                b.extend_from_slice(&chunk[..n]);
+                                let len = b.len();
+                                if len > SCROLLBACK_CAP {
+                                    b.drain(..len - SCROLLBACK_CAP);
+                                }
+                            }
+                        }
+                    }
+                });
+                let pane = Arc::new(Mutex::new(Pane {
+                    master: pair.master,
+                    writer,
+                    child,
+                    buffer,
+                }));
+                self.panes.lock().unwrap().insert(0, Arc::clone(&pane));
+                pane
+            }
+        };
+        let text = format!(
+            "{cmd}
+"
+        );
+        let mut p = pane.lock().unwrap();
+        p.writer
+            .write_all(text.as_bytes())
+            .and_then(|_| p.writer.flush())
+            .map_err(|e| err_internal(&format!("write: {e}")))?;
+        Ok(Json(serde_json::json!({ "fired": true, "pane": 0 })))
     }
 
     #[tool(
@@ -518,6 +592,30 @@ fn cleanup0(bat: &str, outfile: &str, donefile: &str) {
     let _ = std::fs::remove_file(donefile);
 }
 
+fn flex_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        Bool(bool),
+        Str(String),
+        Null,
+    }
+    match Option::<V>::deserialize(deserializer)? {
+        None | Some(V::Null) => Ok(None),
+        Some(V::Bool(b)) => Ok(Some(b)),
+        Some(V::Str(s)) if s.is_empty() || s == "null" => Ok(None),
+        Some(V::Str(s)) => match s.as_str() {
+            "true" | "1" => Ok(Some(true)),
+            "false" | "0" => Ok(Some(false)),
+            _ => Err(serde::de::Error::custom("invalid bool")),
+        },
+    }
+}
+
 fn de_u16_from_string_or_int<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -673,6 +771,9 @@ struct ShellArgs {
     /// Windows only: 1 = interactive desktop (default), 0 = headless SYSTEM task
     #[serde(default, deserialize_with = "de_u8_from_string_or_int")]
     pub session: Option<u8>,
+    /// false (default) = fire-and-forget into the default pane; true = block with capture
+    #[serde(default, deserialize_with = "flex_bool")]
+    pub wait: Option<bool>,
     /// Hard kill after this many seconds (default 120, max 600)
     #[serde(default, deserialize_with = "de_u64_from_string_or_int")]
     pub timeout_s: Option<u64>,
