@@ -444,37 +444,10 @@ impl Workbench {
                     run_captured(&args.cmd, timeout)
                 }
             };
-            // echo the captured transcript into pane 0 so attached TUIs
-            // see what ran here (wait=true used to be pane-invisible)
-            if let Ok(env) = &result {
-                let g = |k: &str| -> String {
-                    env.0.get(k).and_then(serde_json::Value::as_str).unwrap_or("").to_string()
-                };
-                let text = format!(
-                    "\u{1b}[90m$ {}\u{1b}[0m\r\n{}\u{1b}[90m[exit {}]\u{1b}[0m\r\n",
-                    args.cmd,
-                    format!("{}{}", g("stdout"), g("stderr")),
-                    env.0.get("exit_code").and_then(serde_json::Value::as_i64).unwrap_or(-1)
-                );
-                let _ = self.pane0_echo(&text);
-            }
             result
         } else {
             self.shell_fire(&args.cmd)
         }
-    }
-
-    /// Append bytes into pane 0's buffer without touching the shell (a
-    /// transcript record, not typed input).
-    fn pane0_echo(&self, text: &str) -> Result<(), ()> {
-        let pane = self.panes.lock().unwrap().get(&0).cloned();
-        if let Some(pane) = pane {
-            let p = pane.lock().unwrap();
-            let mut b = p.buffer.lock().unwrap();
-            b.extend_from_slice(text.as_bytes());
-            *p.last_write.lock().unwrap() = Instant::now();
-        }
-        Ok(())
     }
 
     fn shell_fire(&self, cmd: &str) -> Result<Json<serde_json::Value>, ErrorData> {
@@ -1083,7 +1056,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
-    eprintln!("vmi-mcp v0.6.4 listening on http://{BIND_ADDRESS}/mcp");
+    eprintln!("vmi-mcp v0.6.3 listening on http://{BIND_ADDRESS}/mcp");
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
