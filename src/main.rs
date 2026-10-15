@@ -538,6 +538,23 @@ where
     }
 }
 
+fn de_u16_req_from_string_or_int<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        Int(u16),
+        Str(String),
+    }
+    match V::deserialize(deserializer)? {
+        V::Int(n) => Ok(n),
+        V::Str(s) => s.parse::<u16>().map_err(serde::de::Error::custom),
+    }
+}
+
 fn de_u32_from_string_or_int<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -593,10 +610,10 @@ struct PaneResizeArgs {
     #[serde(deserialize_with = "de_u32_from_string_or_int")]
     pub id: u32,
     /// New columns
-    #[serde(deserialize_with = "de_u16_from_string_or_int")]
+    #[serde(deserialize_with = "de_u16_req_from_string_or_int")]
     pub cols: u16,
     /// New rows
-    #[serde(deserialize_with = "de_u16_from_string_or_int")]
+    #[serde(deserialize_with = "de_u16_req_from_string_or_int")]
     pub rows: u16,
 }
 
