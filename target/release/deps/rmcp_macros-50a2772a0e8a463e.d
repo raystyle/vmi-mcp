@@ -1,0 +1,13 @@
+D:\hvperv-harness\.tools\vmi-mcp\target\release\deps\rmcp_macros-50a2772a0e8a463e.d: D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\lib.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\common.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\prompt.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\prompt_handler.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\prompt_router.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\tool.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\tool_handler.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\tool_router.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\../README.md
+
+D:\hvperv-harness\.tools\vmi-mcp\target\release\deps\rmcp_macros-50a2772a0e8a463e.dll: D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\lib.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\common.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\prompt.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\prompt_handler.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\prompt_router.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\tool.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\tool_handler.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\tool_router.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\../README.md
+
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\lib.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\common.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\prompt.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\prompt_handler.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\prompt_router.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\tool.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\tool_handler.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\tool_router.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\rmcp-macros-3.5.1\src\../README.md:

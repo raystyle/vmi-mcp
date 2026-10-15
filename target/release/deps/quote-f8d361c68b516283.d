@@ -1,0 +1,13 @@
+D:\hvperv-harness\.tools\vmi-mcp\target\release\deps\quote-f8d361c68b516283.d: D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\lib.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\ext.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\format.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\ident_fragment.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\to_tokens.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\runtime.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\spanned.rs
+
+D:\hvperv-harness\.tools\vmi-mcp\target\release\deps\libquote-f8d361c68b516283.rlib: D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\lib.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\ext.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\format.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\ident_fragment.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\to_tokens.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\runtime.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\spanned.rs
+
+D:\hvperv-harness\.tools\vmi-mcp\target\release\deps\libquote-f8d361c68b516283.rmeta: D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\lib.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\ext.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\format.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\ident_fragment.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\to_tokens.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\runtime.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\spanned.rs
+
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\lib.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\ext.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\format.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\ident_fragment.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\to_tokens.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\runtime.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\quote-1.0.47\src\spanned.rs:

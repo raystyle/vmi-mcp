@@ -22,7 +22,10 @@
 //! daemon with no console flash on the desktop.
 
 // release = background daemon (no console window); debug keeps one
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 //! Known v0.2 limits (documented on purpose): session-0 scratch lives in
 //! the system temp dir (admins+SYSTEM readable); kill reaches the direct
 //! child only; MCP session state is in-memory, so a service restart
@@ -579,10 +582,7 @@ where
         None | Some(StringOrInt::Null) => Ok(None),
         Some(StringOrInt::Int(n)) => Ok(Some(n)),
         Some(StringOrInt::Str(s)) if s.is_empty() || s == "null" => Ok(None),
-        Some(StringOrInt::Str(s)) => s
-            .parse::<u8>()
-            .map(Some)
-            .map_err(serde::de::Error::custom),
+        Some(StringOrInt::Str(s)) => s.parse::<u8>().map(Some).map_err(serde::de::Error::custom),
     }
 }
 
@@ -602,10 +602,7 @@ where
         None | Some(StringOrInt::Null) => Ok(None),
         Some(StringOrInt::Int(n)) => Ok(Some(n)),
         Some(StringOrInt::Str(s)) if s.is_empty() || s == "null" => Ok(None),
-        Some(StringOrInt::Str(s)) => s
-            .parse::<u64>()
-            .map(Some)
-            .map_err(serde::de::Error::custom),
+        Some(StringOrInt::Str(s)) => s.parse::<u64>().map(Some).map_err(serde::de::Error::custom),
     }
 }
 
@@ -636,18 +633,24 @@ struct SpawnArgs {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let ct = tokio_util::sync::CancellationToken::new();
-    // the harness reaches us by guest IP, not localhost: allow the host
-    // forms a lab caller can present (dns-rebinding protection in rmcp
-    // rejects anything not listed here)
+    // callers reach us by guest IP: allow every host form this machine
+    // can present (rmcp's dns-rebinding guard rejects unlisted hosts).
+    // Env VMI_MCP_ALLOWED_HOSTS=comma,separated adds extras.
+    let mut hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+    if let Ok(ifaces) = local_ip_address::list_afinet_netifas() {
+        for (_name, ip) in ifaces {
+            hosts.push(ip.to_string());
+            hosts.push(format!("{ip}:9881"));
+        }
+    }
+    if let Ok(extra) = std::env::var("VMI_MCP_ALLOWED_HOSTS") {
+        for h in extra.split(',').filter(|s| !s.is_empty()) {
+            hosts.push(h.trim().to_string());
+        }
+    }
     let config = StreamableHttpServerConfig::default()
         .with_cancellation_token(ct.child_token())
-        .with_allowed_hosts([
-            "localhost",
-            "127.0.0.1",
-            "::1",
-            "192.168.100.60",
-            "192.168.100.60:9881",
-        ]);
+        .with_allowed_hosts(hosts);
     let service = StreamableHttpService::new(
         || Ok(Workbench::new()),
         LocalSessionManager::default().into(),

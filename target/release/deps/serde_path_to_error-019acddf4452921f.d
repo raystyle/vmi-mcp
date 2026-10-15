@@ -1,0 +1,11 @@
+D:\hvperv-harness\.tools\vmi-mcp\target\release\deps\serde_path_to_error-019acddf4452921f.d: D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\lib.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\de.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\path.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\ser.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\wrap.rs
+
+D:\hvperv-harness\.tools\vmi-mcp\target\release\deps\libserde_path_to_error-019acddf4452921f.rlib: D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\lib.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\de.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\path.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\ser.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\wrap.rs
+
+D:\hvperv-harness\.tools\vmi-mcp\target\release\deps\libserde_path_to_error-019acddf4452921f.rmeta: D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\lib.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\de.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\path.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\ser.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\wrap.rs
+
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\lib.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\de.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\path.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\ser.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serde_path_to_error-0.1.20\src\wrap.rs:

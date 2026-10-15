@@ -1,0 +1,13 @@
+D:\hvperv-harness\.tools\vmi-mcp\target\release\deps\serial2-73395f7d4133488b.d: D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\lib.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\sys\mod.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\sys\windows\mod.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\into_settings.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\serial_port.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\settings.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\os.rs
+
+D:\hvperv-harness\.tools\vmi-mcp\target\release\deps\libserial2-73395f7d4133488b.rlib: D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\lib.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\sys\mod.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\sys\windows\mod.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\into_settings.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\serial_port.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\settings.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\os.rs
+
+D:\hvperv-harness\.tools\vmi-mcp\target\release\deps\libserial2-73395f7d4133488b.rmeta: D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\lib.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\sys\mod.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\sys\windows\mod.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\into_settings.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\serial_port.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\settings.rs D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\os.rs
+
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\lib.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\sys\mod.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\sys\windows\mod.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\into_settings.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\serial_port.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\settings.rs:
+D:\ohmyenv\cargo\registry\src\rsproxy.cn-e3de039b2554c837\serial2-0.2.38\src\os.rs:
