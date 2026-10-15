@@ -1,5 +1,7 @@
 # vmi-mcp
 
+English | [简体中文](README.zh-CN.md)
+
 Universal user-level MCP workbench for VMs: born in the interactive
 session (the only launch path whose children get real windows and the
 user's DPAPI secrets), spoken to over streamable-HTTP from any session.
