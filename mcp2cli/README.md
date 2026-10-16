@@ -1,8 +1,9 @@
 # mcp2cli (vendored, Windows-port patch applied)
 
 Upstream: https://github.com/mcp2cli/source-code @ v0.1.10
-(Apache-2.0). This tree is the upstream snapshot plus our
-`0001-windows-port.patch` already applied in place.
+(Apache-2.0). This tree is a trimmed upstream snapshot (upstream's docs site, nx
+node toolchain and release tooling removed; Rust source, tests and
+configs kept) plus our `0001-windows-port.patch` applied in place.
 
 ## Why vendored here
 
