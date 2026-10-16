@@ -812,39 +812,49 @@ fn draw(
     log_scroll: usize,
 ) {
     let area = f.area();
-    // two stacked screens: the multiplexed shell workbench on top, the
-    // one-shot command record below (log_list), then the status bar.
-    // Min+Min splits the leftover height evenly.
-    let mut cons = vec![Constraint::Min(4)];
+    // header above the shell screen: status rows 1-2 (brand/chips and
+    // title/session/user); the endpoint+keys row stays at the bottom.
+    // two stacked screens in between (shell workbench / command record).
+    let status = status_lines(panes, focus, ctx, log_focus);
+    let head = Paragraph::new(vec![status.lines[0].clone(), status.lines[1].clone()]);
+    let tail = Paragraph::new(vec![status.lines[2].clone()]);
+
+    let mut cons = vec![
+        Constraint::Length(2),  // header: status rows 1-2
+        Constraint::Length(1),  // ── separator
+        Constraint::Min(4),     // shell workbench
+    ];
     if show_log {
         cons.push(Constraint::Length(1)); // ── separator
         cons.push(Constraint::Min(4)); // command record screen
     }
     cons.push(Constraint::Length(1)); // ── separator
-    cons.push(Constraint::Length(3)); // status
+    cons.push(Constraint::Length(1)); // endpoint + keys
     let rows = Layout::vertical(cons).split(area);
 
-    let mut idx = 0;
-    let main = rows[idx];
-    idx += 1;
+    f.render_widget(head, rows[0]);
+    f.render_widget(separator(width_of(&rows[1])), rows[1]);
     if let Some(p) = panes.get(focus) {
-        render_grid(f, main, p);
+        render_grid(f, rows[2], p);
     } else {
-        f.render_widget(Paragraph::new("no panes - Ctrl-B c to open"), main);
+        f.render_widget(Paragraph::new("no panes - Ctrl-B c to open"), rows[2]);
     }
+    let mut idx = 3;
     if show_log {
         f.render_widget(separator(width_of(&rows[idx])), rows[idx]);
         idx += 1;
-        f.render_widget(transcript_block(log, rows[idx].height, log_focus, log_scroll), rows[idx]);
+        f.render_widget(
+            transcript_block(log, rows[idx].height, log_focus, log_scroll),
+            rows[idx],
+        );
         idx += 1;
     }
     f.render_widget(separator(width_of(&rows[idx])), rows[idx]);
     idx += 1;
-    let status = status_lines(panes, focus, ctx, log_focus);
     let status_rows = rows[idx];
-    f.render_widget(Paragraph::new(status.lines), status_rows);
+    f.render_widget(tail, status_rows);
     hits.chip_hits = status.chip_hits;
-    hits.chips_y = status_rows.y;
+    hits.chips_y = 0; // chips now live in the header (row 0)
 }
 
 /// One-shot command record screen: every log_list entry, newest
@@ -1003,7 +1013,7 @@ fn status_lines(panes: &[Pane], focus: usize, ctx: &UiCtx, log_focus: bool) -> S
         Line::from(vec![
             Span::styled(format!(" {}", ctx.url), Style::new().fg(Color::DarkGray)),
             Span::styled(
-                "  Ctrl-B: n/p c x q".to_string(),
+                "  Ctrl-C quit / Ctrl-B: n/p c x g l".to_string(),
                 Style::new().fg(Color::DarkGray),
             ),
         ]),
@@ -1332,6 +1342,10 @@ async fn tui_run(
                 let ctrl = k
                     .modifiers
                     .contains(crossterm::event::KeyModifiers::CONTROL);
+                // Ctrl-C always quits, no prefix needed
+                if ctrl && k.code == crossterm::event::KeyCode::Char('c') {
+                    break;
+                }
                 if pending_prefix {
                     pending_prefix = false;
                     match k.code {
