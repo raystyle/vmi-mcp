@@ -1,0 +1,220 @@
+# Getting Started with mcp2cli
+
+Get from zero to running MCP commands in under a minute.
+
+---
+
+## Prerequisites
+
+- **Rust toolchain** (for building from source) or a pre-built binary
+- An MCP server to connect to (or use the built-in demo mode)
+
+---
+
+## Install
+
+Three ways to get `mcp2cli` on your PATH — pick whichever fits
+your flow.
+
+### 1. One-command install (recommended)
+
+Works on any POSIX shell. The script detects `cargo`, warns if
+`~/.cargo/bin` isn't on your PATH, and installs from the `main`
+branch.
+
+```bash
+curl -fsSL https://mcp2cli.dev/install.sh | sh
+```
+
+Or with `wget`:
+
+```bash
+wget -qO- https://mcp2cli.dev/install.sh | sh
+```
+
+### 2. With an AI agent
+
+Paste this prompt into Claude, Cursor, or any coding agent — it
+will fetch the SKILL.md instructions and set up a config for your
+MCP server:
+
+```text
+Read https://mcp2cli.dev/SKILL.md and set up a cli for my mcp server
+```
+
+### 3. With `cargo`
+
+If you already have a Rust toolchain:
+
+```bash
+cargo install --git https://github.com/mcp2cli/source-code --locked
+```
+
+### Verify
+
+```bash
+mcp2cli --version
+```
+
+See the [full install guide](files/install.md) for requirements,
+man-page setup, PATH configuration, updating, and uninstall steps.
+
+---
+
+## Your First Server Connection
+
+### Option A: Demo Mode (no server needed)
+
+The built-in demo mode uses a file-backed backend — perfect for learning without setting up a real server.
+
+```bash
+# Create a demo config
+mcp2cli config init --name demo --app bridge \
+  --transport streamable_http --endpoint https://demo.invalid/mcp
+
+# Set it as active
+mcp2cli use demo
+
+# Discover capabilities
+mcp2cli ls
+```
+
+### Option B: Local Stdio Server
+
+Spawn a local MCP server as a subprocess:
+
+```bash
+# Create config pointing to a local server
+mcp2cli config init --name local --app bridge --transport stdio \
+  --stdio-command npx \
+  --stdio-arg '@modelcontextprotocol/server-everything'
+
+mcp2cli use local
+mcp2cli ls
+```
+
+### Option C: Remote HTTP Server
+
+Connect to a running HTTP MCP server — here, a hosted email server:
+
+```bash
+mcp2cli config init --name email --app bridge \
+  --transport streamable_http \
+  --endpoint https://mcp.example.com/email
+
+mcp2cli use email
+mcp2cli ls
+```
+
+### Option D: Ad-Hoc (no config file)
+
+Skip configuration entirely with `--url` or `--stdio`:
+
+```bash
+# HTTP server — just point and go
+mcp2cli --url http://127.0.0.1:3001/mcp ls
+
+# Stdio server — just run
+mcp2cli --stdio "npx @modelcontextprotocol/server-everything" ls
+```
+
+---
+
+## Explore What the Server Offers
+
+```bash
+# List everything
+mcp2cli ls
+
+# Filter by type
+mcp2cli ls --tools         # Tools only
+mcp2cli ls --resources     # Resources only
+mcp2cli ls --prompts       # Prompts only
+
+# Search
+mcp2cli ls --filter draft
+```
+
+---
+
+## Call a Tool
+
+Server tools become typed CLI commands. Flags come directly from JSON Schema:
+
+```bash
+# Simple tool call
+mcp2cli send --to user@example.com --subject "Hi" --body "hello world"
+
+# Tool with multiple arguments
+mcp2cli reply --thread-id 123 --body "Thanks!"
+
+# Tool with complex arguments
+mcp2cli draft create --subject "New" --labels '["alpha","beta"]'
+```
+
+---
+
+## Read a Resource
+
+```bash
+# By URI
+mcp2cli get mail://inbox
+
+# Resource template (parameterized)
+mcp2cli get mail://thread/123
+```
+
+---
+
+## Run a Prompt
+
+```bash
+mcp2cli simple-prompt
+mcp2cli complex-prompt --temperature 0.7 --style concise
+```
+
+---
+
+## Create a Symlink Alias
+
+Make your server feel like a standalone application:
+
+```bash
+mcp2cli link create --name email
+
+# Now use it directly
+email ls
+email send --to user@example.com --subject "Hi" --body "hello from alias"
+email doctor
+```
+
+---
+
+## JSON Output for Scripts
+
+Every command supports structured JSON output:
+
+```bash
+# JSON envelope
+email --json ls
+
+# Pipe to jq
+email --json search --query "from:boss" | jq '.data'
+
+# NDJSON for streaming
+email --output ndjson ls
+```
+
+---
+
+## What's Next?
+
+| Goal | Read |
+|------|------|
+| Configure timeout, logging, events | [Configuration Reference](reference/config-reference.md) |
+| Customize command names and grouping | [Profile Overlays](features/profile-overlays.md) |
+| Run background jobs | [Background Jobs](features/background-jobs.md) |
+| Set up CI/CD pipelines | [Shell Scripting with MCP](articles/shell-scripting-mcp.md) |
+| Connect AI agents | [AI Agents + MCP via CLI](articles/ai-agents-mcp-cli.md) |
+| Manage multiple servers | [Named Configs & Aliases](features/named-configs-and-aliases.md) |
+| Keep connections warm | [Daemon Mode](features/daemon-mode.md) |

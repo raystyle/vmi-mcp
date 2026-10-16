@@ -1,0 +1,931 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+
+// -------------------------------------------------------------
+// Types / DSL
+// -------------------------------------------------------------
+
+type Line =
+  | { kind: 'prompt'; text: string; comment?: string }
+  | { kind: 'output'; text: string; tone?: 'muted' | 'ok' | 'warn' }
+  | { kind: 'blank' };
+
+type WizardOption = {
+  id: string;
+  label: string;
+  hint?: string;
+  run: Line[];
+};
+
+type Step =
+  | { kind: 'commands'; lines: Line[] }
+  | { kind: 'wizard'; question: string; options: WizardOption[] };
+
+// -------------------------------------------------------------
+// Script
+// -------------------------------------------------------------
+
+const INSTALL_SCRIPT: Step = {
+  kind: 'commands',
+  lines: [
+    {
+      kind: 'prompt',
+      text: 'curl -fsSL https://mcp2cli.dev/install.sh | sh',
+      comment: '# install',
+    },
+    { kind: 'output', text: 'mcp2cli installing v0.1.4 for aarch64-apple-darwin', tone: 'muted' },
+    { kind: 'output', text: 'mcp2cli downloading mcp2cli-aarch64-apple-darwin.tar.gz', tone: 'muted' },
+    { kind: 'output', text: 'ok      checksum verified', tone: 'ok' },
+    { kind: 'output', text: 'mcp2cli extracting archive', tone: 'muted' },
+    { kind: 'output', text: 'ok      installed: ~/.cargo/bin/mcp2cli', tone: 'ok' },
+    { kind: 'blank' },
+    {
+      kind: 'prompt',
+      text: 'mcp2cli config init --name email \\\n    --transport streamable_http \\\n    --endpoint https://mcp.example.com/email',
+    },
+    { kind: 'output', text: 'name: email', tone: 'muted' },
+    { kind: 'output', text: 'app profile: bridge', tone: 'muted' },
+    { kind: 'output', text: 'transport: streamable_http', tone: 'muted' },
+    { kind: 'output', text: 'file: ~/.config/mcp2cli/configs/email.yaml', tone: 'muted' },
+    { kind: 'output', text: 'endpoint: https://mcp.example.com/email', tone: 'muted' },
+    { kind: 'blank' },
+    { kind: 'prompt', text: 'mcp2cli link create --name email' },
+    { kind: 'output', text: 'name: email', tone: 'muted' },
+    { kind: 'output', text: 'link: ~/.local/bin/email', tone: 'muted' },
+    { kind: 'output', text: 'target: ~/.cargo/bin/mcp2cli', tone: 'muted' },
+    { kind: 'output', text: 'man page: ~/.local/share/man/man1/email.1', tone: 'ok' },
+  ],
+};
+
+const WIZARD_STEP: Step = {
+  kind: 'wizard',
+  question: 'What would you like to try?',
+  options: [
+    {
+      id: 'ls',
+      label: 'email ls',
+      hint: 'Discover the server capabilities',
+      run: [
+        { kind: 'prompt', text: 'email ls' },
+        { kind: 'output', text: '[email] discovered 4 capabilities via mcp.example.com', tone: 'muted' },
+        { kind: 'output', text: '[email] discovered 2 resources via mcp.example.com', tone: 'muted' },
+        { kind: 'output', text: '[email] discovered 2 prompts via mcp.example.com', tone: 'muted' },
+        { kind: 'output', text: 'TOOLS:', tone: 'muted' },
+        { kind: 'output', text: '  send                  Send a message', tone: 'muted' },
+        { kind: 'output', text: '  reply                 Reply within a thread', tone: 'muted' },
+        { kind: 'output', text: '  search                Search the mailbox', tone: 'muted' },
+        { kind: 'output', text: '  draft.create          Create a draft', tone: 'muted' },
+        { kind: 'output', text: 'RESOURCES:', tone: 'muted' },
+        { kind: 'output', text: '  mail://inbox          Unread and recent messages', tone: 'muted' },
+        { kind: 'output', text: '  mail://thread/{id}    A conversation by id', tone: 'muted' },
+        { kind: 'output', text: 'PROMPTS:', tone: 'muted' },
+        { kind: 'output', text: '  triage                Triage the inbox', tone: 'muted' },
+        { kind: 'output', text: '  daily-summary         Summarize today’s mail', tone: 'muted' },
+      ],
+    },
+    {
+      id: 'send',
+      label: 'email send',
+      hint: 'Call a tool with typed --flags from JSON Schema',
+      run: [
+        { kind: 'prompt', text: 'email send --to user@example.com --subject "Lunch?" --body "1pm at the usual spot"' },
+        { kind: 'output', text: '[email] invoking capability send', tone: 'muted' },
+        { kind: 'output', text: 'queued message 0c1f9a to user@example.com', tone: 'muted' },
+      ],
+    },
+    {
+      id: 'get',
+      label: 'email get',
+      hint: 'Read a resource by URI',
+      run: [
+        { kind: 'prompt', text: 'email get mail://inbox' },
+        { kind: 'output', text: "[email] read 'mail://inbox' via mcp.example.com", tone: 'muted' },
+        { kind: 'output', text: 'uri: mail://inbox', tone: 'muted' },
+        { kind: 'output', text: 'mime_type: application/json', tone: 'muted' },
+        { kind: 'output', text: 'content: 3 unread · boss@example.com "Q3 planning", …', tone: 'muted' },
+      ],
+    },
+    {
+      id: 'doctor',
+      label: 'email doctor',
+      hint: 'Runtime health diagnostics',
+      run: [
+        { kind: 'prompt', text: 'email doctor' },
+        { kind: 'output', text: 'config: email', tone: 'muted' },
+        { kind: 'output', text: 'transport: streamable_http', tone: 'muted' },
+        { kind: 'output', text: 'server: email-mcp 1.4.0', tone: 'muted' },
+        { kind: 'output', text: 'auth: authenticated', tone: 'muted' },
+        { kind: 'output', text: 'inventory: 4 tools, 2 resources, 2 prompts cached', tone: 'muted' },
+      ],
+    },
+    {
+      id: 'auth',
+      label: 'email auth login',
+      hint: 'Store a bearer token (piped, --input-json, or prompt)',
+      run: [
+        { kind: 'prompt', text: 'echo "$EMAIL_TOKEN" | email auth login' },
+        { kind: 'output', text: 'status: authenticated', tone: 'ok' },
+        { kind: 'output', text: 'server: Email MCP', tone: 'muted' },
+      ],
+    },
+    {
+      id: 'background',
+      label: 'email ... --background',
+      hint: 'Long-running job via the MCP tasks extension (2026-07-28 or 2025-11-25)',
+      run: [
+        { kind: 'prompt', text: 'email search --query "from:boss is:unread" --background' },
+        { kind: 'output', text: '[email] invoking capability search', tone: 'muted' },
+        { kind: 'output', text: '[email] job 7f3a1c2e queued created background job for invoke', tone: 'muted' },
+        { kind: 'output', text: 'job: 7f3a1c2e-9b40-4c2a-8d11-1e2f3a4b5c6d', tone: 'muted' },
+        { kind: 'output', text: 'status: queued', tone: 'muted' },
+        { kind: 'prompt', text: 'email jobs list' },
+        { kind: 'output', text: '  7f3a1c2e-9b40-4c2a-8d11-1e2f3a4b5c6d  running  search-3b8f  invoke', tone: 'muted' },
+      ],
+    },
+    {
+      id: 'prompt',
+      label: 'email prompt run',
+      hint: 'Run a server prompt (guided flow)',
+      run: [
+        { kind: 'prompt', text: 'email prompt run triage' },
+        { kind: 'output', text: "[email] executed prompt 'triage' via mcp.example.com", tone: 'muted' },
+        { kind: 'output', text: 'prompt: triage', tone: 'muted' },
+        { kind: 'output', text: 'description: Triage the inbox', tone: 'muted' },
+        { kind: 'output', text: 'output:', tone: 'muted' },
+        { kind: 'output', text: '  6 unread — 2 need a reply, 1 invite, 3 newsletters', tone: 'muted' },
+      ],
+    },
+    {
+      id: 'json',
+      label: 'email --json …',
+      hint: 'Structured JSON envelope for scripts and jq',
+      run: [
+        { kind: 'prompt', text: 'email --json tool call send --arg to=user@example.com --arg subject="Hi"' },
+        { kind: 'output', text: '{', tone: 'muted' },
+        { kind: 'output', text: '  "app_id": "email",', tone: 'muted' },
+        { kind: 'output', text: '  "command": "invoke",', tone: 'muted' },
+        { kind: 'output', text: '  "summary": "send completed",', tone: 'muted' },
+        { kind: 'output', text: '  "lines": ["queued message 0c1f9a to user@example.com"],', tone: 'muted' },
+        { kind: 'output', text: '  "data": { "capability": "send", "arguments": { "to": "user@example.com", "subject": "Hi" } }', tone: 'muted' },
+        { kind: 'output', text: '}', tone: 'muted' },
+      ],
+    },
+  ],
+};
+
+const SCRIPT: Step[] = [INSTALL_SCRIPT, WIZARD_STEP];
+
+// -------------------------------------------------------------
+// Timing
+// -------------------------------------------------------------
+
+const CHAR_DELAY_MS = 22;
+const CHAR_JITTER_MS = 18;
+const LINE_DELAY_MS = 90;
+const PROMPT_PAUSE_MS = 260;
+
+const jitterDelay = () =>
+  CHAR_DELAY_MS + Math.floor(Math.random() * CHAR_JITTER_MS);
+
+// -------------------------------------------------------------
+// Tailwind arbitrary-value classes that map onto the shared
+// code-block CSS variables (defined in globals.css, swapped per
+// theme). Keeping them in one place so the interactive terminal
+// stays in lockstep with expressive-code fences.
+// -------------------------------------------------------------
+
+const BODY_BG = 'bg-[color:var(--code-bg)]';
+const TITLEBAR_BG = 'bg-[color:var(--code-chrome)]';
+const BORDER = 'border-[color:var(--code-hairline)]';
+const TEXT_FG = 'text-[color:var(--code-fg)]';
+const TEXT_MUTED = 'text-[color:var(--code-fg-muted)]';
+const TEXT_OK = 'text-[color:var(--code-ok)]';
+
+// -------------------------------------------------------------
+// Shell-command tokenizer — enough to get a zsh-ish vibe on each
+// prompt line without pulling a full grammar in. The first
+// non-whitespace token in the *line* is the command; everything
+// else follows a small set of pattern rules. Multi-line commands
+// (backslash continuations) restart the "first token" heuristic
+// on each logical line.
+// -------------------------------------------------------------
+
+type Tok = { text: string; cls: string | null };
+
+// Any `scheme://…` (https, file, mail, demo, …) plus relative/home paths, so
+// resource URIs like `mail://inbox` highlight like the http/file ones do.
+const URL_RE = /^(?:[a-z][\w+.-]*:\/\/|\.?\.?\/|~\/)[\w\-./%?&=#:{}@~]*$/i;
+const FLAG_RE = /^--?[A-Za-z][\w-]*/;
+const STRING_RE = /^["'].*["']$/;
+const OP_RE = /^(?:\||\|\||&&|;|>>|>|<<|<)$/;
+
+function tokenizeShell(text: string): Tok[] {
+  const out: Tok[] = [];
+  const parts = text.split(/(\s+)/);
+  let expectCommand = true; // next non-whitespace token is the command
+  for (const part of parts) {
+    if (part === '') continue;
+    if (/^\s+$/.test(part)) {
+      if (/\n/.test(part)) expectCommand = true;
+      out.push({ text: part, cls: null });
+      continue;
+    }
+    // Shell operators — after one of these, the next token is a
+    // new command (`cmd1 | cmd2`, `cmd1 && cmd2`, etc.).
+    if (OP_RE.test(part)) {
+      out.push({ text: part, cls: 'tok-op' });
+      expectCommand = true;
+      continue;
+    }
+    if (expectCommand) {
+      expectCommand = false;
+      // A continuation line may start with a flag — let the flag
+      // matcher re-classify it.
+      if (FLAG_RE.test(part)) {
+        out.push({ text: part, cls: 'tok-flag' });
+      } else {
+        out.push({ text: part, cls: 'tok-cmd' });
+      }
+      continue;
+    }
+    if (FLAG_RE.test(part)) {
+      out.push({ text: part, cls: 'tok-flag' });
+    } else if (STRING_RE.test(part)) {
+      out.push({ text: part, cls: 'tok-str' });
+    } else if (URL_RE.test(part)) {
+      out.push({ text: part, cls: 'tok-url' });
+    } else {
+      // Bare arguments (subcommands, values, file paths without a
+      // leading ./) — Shiki's bash grammar paints these as strings,
+      // so we match that for parity with the docs fences.
+      out.push({ text: part, cls: 'tok-str' });
+    }
+  }
+  return out;
+}
+
+function tokenClass(cls: string | null): string {
+  switch (cls) {
+    case 'tok-cmd':
+      return 'text-[color:var(--tok-cmd)]';
+    case 'tok-flag':
+      return 'text-[color:var(--tok-flag)]';
+    case 'tok-str':
+      return 'text-[color:var(--tok-str)]';
+    case 'tok-url':
+      return 'text-[color:var(--tok-url)]';
+    case 'tok-op':
+      return 'text-[color:var(--tok-op)]';
+    default:
+      return TEXT_FG;
+  }
+}
+
+function HighlightedCommand({ text }: { text: string }) {
+  const tokens = tokenizeShell(text);
+  return (
+    <>
+      {tokens.map((t, i) => {
+        const cls = t.cls ? tokenClass(t.cls) : TEXT_FG;
+        return (
+          <span key={i} className={cls}>
+            {t.text}
+          </span>
+        );
+      })}
+    </>
+  );
+}
+
+// -------------------------------------------------------------
+// Internal run model — a Run is a sequence of Line records that
+// the component animates one char at a time.
+// -------------------------------------------------------------
+
+type Run = {
+  id: string;
+  lines: Line[];
+};
+
+// -------------------------------------------------------------
+// Rendering helpers
+// -------------------------------------------------------------
+
+function LineBody({
+  line,
+  revealed,
+  isActive,
+}: {
+  line: Line;
+  revealed: string;
+  isActive: boolean;
+}) {
+  if (line.kind === 'blank') {
+    return <div className="h-[1.5em]" aria-hidden="true" />;
+  }
+
+  if (line.kind === 'output') {
+    const toneClass =
+      line.tone === 'ok' ? TEXT_OK : line.tone === 'warn' ? 'text-amber-400' : TEXT_MUTED;
+    return (
+      <div className={`whitespace-pre-wrap ${toneClass}`}>
+        {revealed}
+        {isActive ? <Caret /> : null}
+      </div>
+    );
+  }
+
+  // Prompt line.
+  return (
+    <div className="whitespace-pre-wrap">
+      <span className={`${TEXT_MUTED} select-none`}>$ </span>
+      {isActive ? (
+        <>
+          <span className={TEXT_FG}>{revealed}</span>
+          <Caret />
+        </>
+      ) : (
+        <>
+          <HighlightedCommand text={revealed} />
+          {line.comment ? (
+            <span className={`text-[color:var(--tok-com)]`}>
+              {'  ' + line.comment}
+            </span>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+}
+
+function Caret() {
+  return (
+    <span
+      aria-hidden="true"
+      className="ml-[1px] inline-block h-[1em] w-[0.55em] -translate-y-[1px] bg-[color:var(--code-fg)] align-middle animate-[terminal-blink_1.1s_step-end_infinite]"
+    />
+  );
+}
+
+// -------------------------------------------------------------
+// Completed run: no animation, full content.
+// -------------------------------------------------------------
+
+function StaticLines({ lines }: { lines: Line[] }) {
+  return (
+    <div>
+      {lines.map((line, i) => {
+        if (line.kind === 'blank')
+          return <div key={i} className="h-[1.5em]" aria-hidden="true" />;
+        if (line.kind === 'output') {
+          const tone =
+            line.tone === 'ok' ? TEXT_OK : line.tone === 'warn' ? 'text-amber-400' : TEXT_MUTED;
+          return (
+            <div key={i} className={`whitespace-pre-wrap ${tone}`}>
+              {line.text}
+            </div>
+          );
+        }
+        return (
+          <div key={i} className="whitespace-pre-wrap">
+            <span className={`${TEXT_MUTED} select-none`}>$ </span>
+            <HighlightedCommand text={line.text} />
+            {line.comment ? (
+              <span className={`text-[color:var(--tok-com)]`}>
+                {'  ' + line.comment}
+              </span>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// -------------------------------------------------------------
+// The animated run: one Line at a time, char by char.
+// -------------------------------------------------------------
+
+function AnimatedRun({
+  run,
+  onDone,
+  skip,
+}: {
+  run: Run;
+  onDone: () => void;
+  skip: boolean;
+}) {
+  const [lineIdx, setLineIdx] = useState(0);
+  const [charIdx, setCharIdx] = useState(0);
+
+  useEffect(() => {
+    // Reset when the run changes.
+    setLineIdx(0);
+    setCharIdx(0);
+  }, [run.id]);
+
+  useEffect(() => {
+    if (skip) {
+      if (lineIdx < run.lines.length) {
+        setLineIdx(run.lines.length);
+      } else {
+        onDone();
+      }
+      return;
+    }
+
+    if (lineIdx >= run.lines.length) {
+      onDone();
+      return;
+    }
+
+    const line = run.lines[lineIdx];
+
+    if (line.kind === 'blank') {
+      const t = setTimeout(() => {
+        setLineIdx((i) => i + 1);
+        setCharIdx(0);
+      }, LINE_DELAY_MS);
+      return () => clearTimeout(t);
+    }
+
+    if (charIdx < line.text.length) {
+      const t = setTimeout(
+        () => setCharIdx((c) => c + 1),
+        line.kind === 'prompt' ? jitterDelay() : 4,
+      );
+      return () => clearTimeout(t);
+    }
+
+    const pause = line.kind === 'prompt' ? PROMPT_PAUSE_MS : LINE_DELAY_MS;
+    const t = setTimeout(() => {
+      setLineIdx((i) => i + 1);
+      setCharIdx(0);
+    }, pause);
+    return () => clearTimeout(t);
+  }, [lineIdx, charIdx, run, skip, onDone]);
+
+  return (
+    <div>
+      {run.lines.slice(0, lineIdx).map((line, i) => (
+        <LineBody
+          key={`${run.id}-l-${i}`}
+          line={line}
+          revealed={line.kind === 'blank' ? '' : line.text}
+          isActive={false}
+        />
+      ))}
+      {lineIdx < run.lines.length ? (
+        <LineBody
+          key={`${run.id}-active`}
+          line={run.lines[lineIdx]}
+          revealed={
+            run.lines[lineIdx].kind === 'blank'
+              ? ''
+              : run.lines[lineIdx].text.slice(0, charIdx)
+          }
+          isActive={run.lines[lineIdx].kind !== 'blank'}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+// -------------------------------------------------------------
+// Wizard menu. The same markup is used for both the active menu
+// (interactive; key/mouse input) and its frozen scrollback twin
+// (read-only, with the picked option highlighted). Sharing the
+// component keeps the two variants pixel-identical so the
+// transition from "live menu" → "decision recorded" feels like the
+// menu simply stopped accepting input — no layout jump.
+// -------------------------------------------------------------
+
+type WizardOptionsProps = {
+  question: string;
+  options: WizardOption[];
+  selected: number;
+  onSelect?: (idx: number) => void;
+  onPick?: (option: WizardOption) => void;
+  pickedId?: string; // when set, menu is read-only and shows the pick
+  footer?: React.ReactNode;
+};
+
+function WizardBody({
+  question,
+  options,
+  selected,
+  onSelect,
+  onPick,
+  pickedId,
+  footer,
+}: WizardOptionsProps) {
+  const pickedIdx = pickedId ? options.findIndex((o) => o.id === pickedId) : -1;
+  return (
+    <>
+      <div className={`mb-2 ${TEXT_FG}`}>{question}</div>
+      <ul className="space-y-0.5">
+        {options.map((opt, i) => {
+          const highlight =
+            pickedIdx >= 0 ? i === pickedIdx : i === selected;
+          const clickable = pickedIdx < 0 && onPick;
+          const Row = (
+            <div
+              className={`flex w-full items-baseline gap-2 rounded px-2 py-1 text-left ${
+                highlight
+                  ? `${TITLEBAR_BG} ${TEXT_FG}`
+                  : `${TEXT_MUTED}`
+              } ${clickable ? 'cursor-pointer transition hover:text-[color:var(--code-fg)]' : ''}`}
+            >
+              <span
+                aria-hidden="true"
+                className={`w-3 text-center ${highlight ? TEXT_OK : 'text-transparent'}`}
+              >
+                ▸
+              </span>
+              <span className="font-medium">{opt.label}</span>
+              {opt.hint ? <span className={TEXT_MUTED}>— {opt.hint}</span> : null}
+            </div>
+          );
+          if (!clickable) {
+            return <li key={opt.id}>{Row}</li>;
+          }
+          return (
+            <li key={opt.id}>
+              <button
+                type="button"
+                onMouseEnter={() => onSelect?.(i)}
+                onClick={() => onPick?.(opt)}
+                className="block w-full text-left"
+              >
+                {Row}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      {footer}
+    </>
+  );
+}
+
+function StaticWizard({
+  question,
+  options,
+  pickedId,
+}: {
+  question: string;
+  options: WizardOption[];
+  pickedId: string;
+}) {
+  return (
+    <div className="mb-3">
+      <WizardBody
+        question={question}
+        options={options}
+        selected={-1}
+        pickedId={pickedId}
+      />
+    </div>
+  );
+}
+
+function Wizard({
+  question,
+  options,
+  onPick,
+  autoFocus,
+}: {
+  question: string;
+  options: WizardOption[];
+  onPick: (option: WizardOption) => void;
+  autoFocus: boolean;
+}) {
+  const [selected, setSelected] = useState(0);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    // `preventScroll: true` so focusing the wizard for keyboard nav
+    // doesn't yank the page when the menu appears a few seconds into
+    // the autoplay. Keyboard users can still Tab into it.
+    if (autoFocus) containerRef.current?.focus({ preventScroll: true });
+  }, [autoFocus]);
+
+  const handleKey = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (e.key === 'ArrowDown' || (e.key === 'Tab' && !e.shiftKey)) {
+        e.preventDefault();
+        setSelected((s) => (s + 1) % options.length);
+      } else if (e.key === 'ArrowUp' || (e.key === 'Tab' && e.shiftKey)) {
+        e.preventDefault();
+        setSelected((s) => (s - 1 + options.length) % options.length);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        onPick(options[selected]);
+      } else if (/^[1-9]$/.test(e.key)) {
+        const idx = parseInt(e.key, 10) - 1;
+        if (idx < options.length) {
+          e.preventDefault();
+          onPick(options[idx]);
+        }
+      }
+    },
+    [options, onPick, selected],
+  );
+
+  return (
+    <div
+      ref={containerRef}
+      tabIndex={0}
+      onKeyDown={handleKey}
+      className="mb-3 outline-none focus-visible:ring-1 focus-visible:ring-[color:var(--code-fg-muted)] rounded"
+    >
+      <WizardBody
+        question={question}
+        options={options}
+        selected={selected}
+        onSelect={setSelected}
+        onPick={onPick}
+        footer={
+          <div className={`mt-2 text-[11px] ${TEXT_MUTED} opacity-80`}>
+            ↑↓ select · Enter to run · 1–{options.length} shortcut
+          </div>
+        }
+      />
+    </div>
+  );
+}
+
+// -------------------------------------------------------------
+// Top-level component
+// -------------------------------------------------------------
+
+type HistoryEntry =
+  | { kind: 'run'; id: string; lines: Line[] }
+  | {
+      kind: 'decision';
+      id: string;
+      stepIdx: number;
+      question: string;
+      options: WizardOption[];
+      pickedId: string;
+    };
+
+type Phase =
+  | { kind: 'running'; run: Run; stepIdx: number }
+  | { kind: 'wizard'; stepIdx: number }
+  | { kind: 'done' };
+
+// How many options to show in any one menu. Picked options are
+// removed, and the next unpicked option from the pool slots in, so
+// the menu always feels fresh until the pool is exhausted.
+const MENU_SIZE = 4;
+
+export default function InteractiveTerminal() {
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [phase, setPhase] = useState<Phase>(() =>
+    SCRIPT[0].kind === 'commands'
+      ? { kind: 'running', run: { id: 'intro', lines: (SCRIPT[0] as { lines: Line[] }).lines }, stepIdx: 0 }
+      : { kind: 'wizard', stepIdx: 0 },
+  );
+  const [runToken, setRunToken] = useState(0);
+  const [wizardToken, setWizardToken] = useState(0);
+  const [pickedIds, setPickedIds] = useState<Set<string>>(new Set());
+  const [skip, setSkip] = useState(false);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+
+  // The slice of the wizard pool that the user currently sees —
+  // all options they haven't already picked, capped to MENU_SIZE.
+  const visibleOptions: WizardOption[] = (() => {
+    if (phase.kind !== 'wizard') return [];
+    const step = SCRIPT[phase.stepIdx];
+    if (!step || step.kind !== 'wizard') return [];
+    return step.options.filter((o) => !pickedIds.has(o.id)).slice(0, MENU_SIZE);
+  })();
+
+  // Auto-tail: pin the scroll container to the bottom whenever its
+  // content grows. A ResizeObserver is load-bearing here — the
+  // parent component doesn't re-render on every character the
+  // AnimatedRun child types (child owns its own state), so a plain
+  // useEffect-on-render never fires mid-animation and the terminal
+  // stops scrolling once content overflows the 420px viewport.
+  //
+  // Smoothness: we only actually scroll when the content's *height*
+  // grew (ignore width jitter as characters slot in), and we use a
+  // short CSS-driven eased animation via scrollTo({ behavior }) so
+  // the viewport glides into position instead of snapping.
+  useEffect(() => {
+    const scroll = scrollRef.current;
+    const content = contentRef.current;
+    if (!scroll || !content) return;
+    let lastHeight = content.scrollHeight;
+    const pin = (behavior: ScrollBehavior = 'smooth') => {
+      scroll.scrollTo({ top: scroll.scrollHeight, behavior });
+    };
+    pin('instant' as ScrollBehavior);
+    const ro = new ResizeObserver((entries) => {
+      const box = entries[0]?.contentRect;
+      if (!box) return;
+      const h = content.scrollHeight;
+      if (h === lastHeight) return;
+      lastHeight = h;
+      pin('smooth');
+    });
+    ro.observe(content);
+    return () => ro.disconnect();
+  }, []);
+
+  const advanceFromRun = useCallback(() => {
+    if (phase.kind !== 'running') return;
+    const next = SCRIPT[phase.stepIdx + 1];
+    setHistory((h) => [
+      ...h,
+      { kind: 'run', id: phase.run.id, lines: phase.run.lines },
+    ]);
+    if (!next) {
+      setPhase({ kind: 'done' });
+      return;
+    }
+    if (next.kind === 'wizard') {
+      setWizardToken((n) => n + 1);
+      setPhase({ kind: 'wizard', stepIdx: phase.stepIdx + 1 });
+    } else {
+      setPhase({
+        kind: 'running',
+        run: { id: `step-${phase.stepIdx + 1}-${Date.now()}`, lines: next.lines },
+        stepIdx: phase.stepIdx + 1,
+      });
+    }
+  }, [phase]);
+
+  const handlePick = useCallback(
+    (opt: WizardOption) => {
+      if (phase.kind !== 'wizard') return;
+      const wizardStep = SCRIPT[phase.stepIdx];
+      if (!wizardStep || wizardStep.kind !== 'wizard') return;
+      // Freeze the menu into scrollback with the picked option
+      // highlighted so the user sees their choice stay put, then
+      // start the picked run below it. The decision entry records
+      // exactly the options that were visible at the moment of the
+      // pick (not the full pool) — keeps scrollback honest.
+      const visibleAtPick = wizardStep.options
+        .filter((o) => !pickedIds.has(o.id))
+        .slice(0, MENU_SIZE);
+      setPickedIds((ids) => {
+        const next = new Set(ids);
+        next.add(opt.id);
+        return next;
+      });
+      setHistory((h) => [
+        ...h,
+        {
+          kind: 'decision',
+          id: `decision-${phase.stepIdx}-${Date.now()}`,
+          stepIdx: phase.stepIdx,
+          question: wizardStep.question,
+          options: visibleAtPick,
+          pickedId: opt.id,
+        },
+      ]);
+      setSkip(false);
+      setRunToken((n) => n + 1);
+      setPhase({
+        kind: 'running',
+        run: { id: `${opt.id}-${Date.now()}`, lines: opt.run },
+        stepIdx: phase.stepIdx,
+      });
+    },
+    [phase, pickedIds],
+  );
+
+  const handleRunDone = useCallback(() => {
+    if (phase.kind !== 'running') return;
+    const currentStep = SCRIPT[phase.stepIdx];
+    if (currentStep && currentStep.kind === 'wizard') {
+      // Command picked from the wizard finished — scroll it into
+      // history. If the pool still has unpicked options, present
+      // a fresh menu below; otherwise mark the tour done so the
+      // terminal body ends on a subtle restart hint.
+      setHistory((h) => [
+        ...h,
+        { kind: 'run', id: phase.run.id, lines: phase.run.lines },
+      ]);
+      const remaining = currentStep.options.filter(
+        (o) => !pickedIds.has(o.id),
+      ).length;
+      if (remaining === 0) {
+        setPhase({ kind: 'done' });
+      } else {
+        setWizardToken((n) => n + 1);
+        setPhase({ kind: 'wizard', stepIdx: phase.stepIdx });
+      }
+    } else {
+      advanceFromRun();
+    }
+  }, [phase, advanceFromRun, pickedIds]);
+
+  const restart = useCallback(() => {
+    setHistory([]);
+    setSkip(false);
+    setRunToken((n) => n + 1);
+    setWizardToken((n) => n + 1);
+    setPickedIds(new Set());
+    const first = SCRIPT[0];
+    if (first.kind === 'commands') {
+      setPhase({
+        kind: 'running',
+        run: { id: `intro-${Date.now()}`, lines: first.lines },
+        stepIdx: 0,
+      });
+    } else {
+      setPhase({ kind: 'wizard', stepIdx: 0 });
+    }
+  }, []);
+
+  const handleBodyClick = useCallback(() => {
+    if (phase.kind === 'running') setSkip(true);
+  }, [phase]);
+
+  return (
+    <div className={`relative overflow-hidden rounded-lg border ${BORDER} ${BODY_BG}`}>
+      {/* Floating restart button — mirrors the position of the copy
+          button on the sibling code blocks, so the interactive
+          terminal reads as the same kind of surface with a different
+          affordance. */}
+      <button
+        type="button"
+        onClick={restart}
+        aria-label="Restart demo"
+        title="Restart"
+        className={`absolute right-[0.35rem] top-[0.35rem] z-10 flex h-7 w-7 items-center justify-center rounded ${TEXT_MUTED} transition hover:bg-[color:var(--code-chrome)] hover:${TEXT_FG} focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[color:var(--code-fg-muted)]`}
+      >
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.75"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className="h-3.5 w-3.5"
+          aria-hidden="true"
+        >
+          <path d="M3 12a9 9 0 0 1 15.5-6.5L21 8"></path>
+          <path d="M21 3v5h-5"></path>
+          <path d="M21 12a9 9 0 0 1-15.5 6.5L3 16"></path>
+          <path d="M3 21v-5h5"></path>
+        </svg>
+      </button>
+
+      {/* body */}
+      <div
+        ref={scrollRef}
+        onClick={handleBodyClick}
+        className={`h-[420px] overflow-y-auto overflow-x-auto px-4 py-4 font-mono text-[13px] leading-[1.55] ${TEXT_FG}`}
+      >
+        <div ref={contentRef}>
+        {history.map((entry) =>
+          entry.kind === 'run' ? (
+            <div key={entry.id} className="mb-3">
+              <StaticLines lines={entry.lines} />
+            </div>
+          ) : (
+            <StaticWizard
+              key={entry.id}
+              question={entry.question}
+              options={entry.options}
+              pickedId={entry.pickedId}
+            />
+          ),
+        )}
+
+        {phase.kind === 'running' ? (
+          <AnimatedRun
+            key={runToken}
+            run={phase.run}
+            onDone={handleRunDone}
+            skip={skip}
+          />
+        ) : null}
+
+        {phase.kind === 'wizard' ? (
+          <Wizard
+            key={wizardToken}
+            question={(SCRIPT[phase.stepIdx] as { question: string }).question}
+            options={visibleOptions}
+            onPick={handlePick}
+            autoFocus={history.some((h) => h.kind === 'decision')}
+          />
+        ) : null}
+
+        {phase.kind === 'done' ? (
+          <div className="mb-3">
+            <div className={`${TEXT_MUTED}`}>
+              <span className={TEXT_OK}>✓</span> that's the whole tour —
+              hit the ⟳ icon above to run it again.
+            </div>
+          </div>
+        ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}

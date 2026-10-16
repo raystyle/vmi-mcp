@@ -846,7 +846,7 @@ fn draw(
 fn transcript_block(log: &[(String, i64, String)]) -> Paragraph<'static> {
     let mut lines: Vec<Line> = vec![Line::from(Span::styled(
         " wait 通道命令记录".to_string(),
-        Style::new().fg(Color::Black).bg(Color::Yellow),
+        Style::new().fg(Color::DarkGray),
     ))];
     if log.is_empty() {
         lines.push(Line::from(Span::styled(

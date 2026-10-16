@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+
+# Node / Nx
+/node_modules
+.nx
+/dist
+
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

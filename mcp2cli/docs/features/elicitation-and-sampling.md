@@ -1,0 +1,155 @@
+# Elicitation & Sampling
+
+Handle interactive server-initiated requests — when the MCP server needs human input during tool execution.
+
+---
+
+## How Requests Arrive (per protocol revision)
+
+The wire mechanics depend on the negotiated MCP revision; the terminal
+experience is identical either way:
+
+- **MCP 2025-11-25 (legacy):** the server sends its own JSON-RPC requests
+  (`elicitation/create`, `sampling/createMessage`, `roots/list`) on the
+  active stream and mcp2cli answers inline.
+- **MCP 2026-07-28 (modern):** servers no longer send requests. Instead a
+  `tools/call` / `resources/read` / `prompts/get` may return an interim
+  result with `resultType: "input_required"` whose `inputRequests` map
+  embeds the same request shapes (**Multi Round-Trip Requests**, SEP-2322).
+  mcp2cli prompts you exactly as before, then **retries the original
+  request** with your answers in `inputResponses` — echoing the server's
+  opaque `requestState` verbatim and using a fresh request id, as the spec
+  requires. Up to 8 round trips are resolved per command before mcp2cli
+  gives up.
+
+The same applies to elicitations that arrive *inside a task*: when a
+2026-07-28 task reaches `input_required`, mcp2cli prompts and submits the
+answers via `tasks/update` (see [Background Jobs](background-jobs.md)).
+
+---
+
+## Elicitation
+
+### What Is It?
+
+During a tool call, the server may send an `elicitation/create` request asking the user for additional information — a form with fields, or a URL to visit.
+
+### How It Looks
+
+```text
+--- elicitation request ---
+Please provide additional information:
+  Name (Your full name) [required]: John Doe
+  Age [required] [default: 25]: 30
+  Role [options: admin, user, guest]: admin
+--- end elicitation ---
+```
+
+### Type Coercion
+
+mcp2cli automatically coerces typed input:
+
+| Schema Type | Input | Coerced To |
+|-------------|-------|------------|
+| `boolean` | `yes`, `true`, `y`, `1` | `true` |
+| `integer` | `42` | `42` |
+| `number` | `3.14` | `3.14` |
+| `array` | `a,b,c` | `["a","b","c"]` |
+| `enum` | Title matching | Enum value |
+
+### Defaults
+
+When a field has a default value from the schema, pressing Enter without input uses the default.
+
+### URL Mode
+
+If the elicitation contains a URL (e.g., for OAuth), mcp2cli opens it in the browser:
+
+```yaml
+auth:
+  browser_open_command: "xdg-open"    # Or "open" on macOS
+```
+
+---
+
+## Sampling
+
+### What Is It?
+
+The server may send a `sampling/createMessage` request during tool execution, asking the client for a model response. In mcp2cli, this becomes a **human-in-the-loop** prompt — you are the "model."
+
+### How It Looks
+
+```text
+--- sampling request ---
+The server requests a model response.
+Model hint: claude-3-5-sonnet
+System: You are a helpful assistant
+Max tokens: 1000
+
+Messages:
+  [user] Summarize this document: ...
+
+Available tools:
+  search - Search the knowledge base
+  calculate - Perform calculations
+
+Tool choice: auto
+
+Your response (or 'decline' to reject): 
+--- end sampling ---
+```
+
+### Declining
+
+Type `decline` or press Enter with no input to reject the sampling request. The server receives an error response.
+
+### Response
+
+Your text is sent back to the server with `model: "human-in-the-loop"`.
+
+### Tool Information
+
+When the server includes `tools` and `toolChoice` in the sampling request, mcp2cli displays the available tools and their descriptions so you can make an informed response.
+
+---
+
+## Capability Advertisement
+
+mcp2cli advertises these capabilities during MCP initialization (2025-11-25) or in every request's `_meta["io.modelcontextprotocol/clientCapabilities"]` (2026-07-28):
+
+```json
+{
+  "capabilities": {
+    "sampling": {},
+    "elicitation": { "form": {}, "url": {} },
+    "roots": {},
+    "extensions": { "io.modelcontextprotocol/tasks": {} }
+  }
+}
+```
+
+This tells the server it may request elicitation, sampling, and roots input — and, on 2026-07-28 servers, that task-augmented responses are accepted. Per the MRTR rules, a 2026-07-28 server MUST NOT embed an input request the client did not declare support for.
+
+> Note: MCP 2026-07-28 deprecates the Sampling and Roots features
+> (SEP-2577) with a 12-month removal window. mcp2cli continues to answer
+> both for as long as servers use them.
+
+---
+
+## Non-Interactive Mode
+
+In scripts and CI/CD, elicitation and sampling prompts block forever waiting for input. Solutions:
+
+1. **Pre-supply answers with `--input-json`:** `email --input-json '{"subject":"Hi","body":"..."}' send` — provides elicitation field answers up front as a JSON object keyed by field name, so no prompt is shown
+2. **Decline automatically with `--non-interactive`:** `email --non-interactive send` — declines (or fails) instead of prompting whenever the server elicits or samples
+3. **Pipe input:** `echo "value" | email send`
+4. **Use `--timeout`:** `email --timeout 30 send` — fails after 30s if blocked
+5. **Server-side:** Configure the server to skip elicitation for automated clients
+
+---
+
+## See Also
+
+- [Authentication](authentication.md) — OAuth flows may use elicitation
+- [Request Timeouts](request-timeouts.md) — prevent blocking in non-interactive mode

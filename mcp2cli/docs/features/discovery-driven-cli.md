@@ -1,0 +1,169 @@
+# Discovery-Driven CLI
+
+The core innovation of mcp2cli: server capabilities are auto-discovered and transformed into real, typed CLI commands with no manual wiring.
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant mcp2cli
+    participant Cache as Discovery Cache
+    participant Server as MCP Server
+
+    User->>mcp2cli: local echo --message hello
+    mcp2cli->>Cache: Check cached inventory
+    alt Cache hit
+        Cache-->>mcp2cli: Cached tools, resources, prompts
+    else Cache miss / stale
+        mcp2cli->>Server: tools/list, resources/list, prompts/list
+        Server-->>mcp2cli: Capability descriptors + JSON Schema
+        mcp2cli->>Cache: Store inventory
+    end
+    mcp2cli->>mcp2cli: Build CommandManifest
+    mcp2cli->>mcp2cli: Generate clap CLI tree
+    mcp2cli->>mcp2cli: Parse "echo --message hello"
+    mcp2cli->>Server: tools/call { name: "echo", arguments: { message: "hello" } }
+    Server-->>mcp2cli: Result
+    mcp2cli-->>User: Formatted output
+```
+
+---
+
+## The Command Manifest
+
+When mcp2cli discovers a server's capabilities, it builds a **CommandManifest** — a typed command tree where:
+
+- **Tools** → become verb commands (e.g., `echo`, `deploy`, `add`)
+- **Prompts** → become workflow commands (e.g., `simple-prompt`, `code-review`)
+- **Resources** → `get <URI>` for direct resource reads
+- **Resource Templates** → parameterized commands with typed flags
+
+### Schema-to-Flag Mapping
+
+Tool `inputSchema` and prompt `arguments` are converted to real CLI flags:
+
+| JSON Schema Type | CLI Flag Type | Example |
+|-----------------|---------------|---------|
+| `string` | `--name <TEXT>` | `--message "hello"` |
+| `integer` | `--count <INT>` | `--steps 5` |
+| `number` | `--rate <NUM>` | `--temperature 0.7` |
+| `boolean` | `--flag` (no value) | `--include-image` |
+| `enum` | `--kind <A\|B\|C>` | `--level error` |
+| `array` | `--items <VAL,...>` | `--tags bug,urgent` |
+| Complex object | `--config <JSON>` | `--config '{"a":1}'` |
+
+**Required** fields become required flags. **Defaults** from JSON Schema are applied when flags are omitted.
+
+---
+
+## Namespace Grouping
+
+Dotted tool names automatically become nested subcommands:
+
+```text
+Server tools:
+  send
+  reply
+  draft.create
+  labels.add
+
+CLI becomes:
+  email send --to user@example.com --body "Hello"
+  email reply --thread-id 123 --body "Thanks"
+  email draft create --subject "New draft"
+  email labels add --name urgent --color red
+```
+
+```mermaid
+graph LR
+    A["send"] --> F["email"]
+    C["reply"] --> F
+    D["draft.create"] --> E["draft"]
+    E --> F
+    G["labels.add"] --> H["labels"]
+    H --> F
+```
+
+---
+
+## Resource Templates as Commands
+
+URI templates like `user://profile/{user_id}` become parameterized commands:
+
+```bash
+# Single parameter → positional argument
+email mail-search "invoices 2026"
+
+# Multiple parameters → typed flags
+email user-profile --user-id 42 --format json
+```
+
+---
+
+## Discovery Cache & Offline Mode
+
+Discovery results are cached in `~/.local/share/mcp2cli/instances/<name>/discovery.json`. This means:
+
+1. **First run:** Nothing is cached, so the first command discovers automatically — `email send --to …` works on a fresh config without running `ls` first. Built-ins such as `auth login` skip this, so they work even when the server cannot be asked yet.
+2. **Subsequent runs:** Instant startup from cache
+3. **Offline:** Commands still work from cache
+4. **Cache invalidation:** When the server sends `notifications/tools/list_changed` (or similar), a stale marker is written. Next `ls` triggers live re-discovery.
+
+If the very first discovery fails, the error names the actual problem rather than an unknown command:
+
+```text
+error: could not load the command list from Email Server: …
+
+If the server requires authentication, run `email auth login` first.
+```
+
+This first discovery is time-boxed (10 seconds before `--help`, 30 before a command; `--timeout` overrides), so an unreachable server delays the first run briefly instead of for the full operation timeout.
+
+The `discovery` config section controls this: `auto: false` turns on-demand discovery off, `ttl_seconds` re-discovers periodically, and `snapshot` ships a command list with a [published CLI](branded-cli.md#discovery).
+
+Force a live re-discovery:
+
+```bash
+email ls    # Uses cache if fresh; re-discovers if stale
+```
+
+---
+
+## Runtime Commands
+
+These are always available alongside discovered commands — no server schema needed. (A [branded CLI](branded-cli.md#built-in-commands) exposes only the ones it lists.)
+
+| Command | Purpose |
+|---------|---------|
+| `ls` | List all capabilities (with `--tools`, `--resources`, `--prompts`, `--filter`) |
+| `ping` | Server liveness check with latency measurement |
+| `log <LEVEL>` | Set server-side log verbosity |
+| `complete <ref> <name> <arg> [value]` | Request tab-completions from server |
+| `subscribe <URI>` | Subscribe to resource change notifications |
+| `unsubscribe <URI>` | Unsubscribe from resource notifications |
+| `auth login/logout/status` | Authentication management |
+| `jobs list/show/wait/cancel/watch` | Background job management |
+| `doctor` | Runtime health diagnostics |
+| `inspect` | Full server capability dump |
+
+---
+
+## Static vs. Dynamic CLI
+
+mcp2cli has two parsing layers:
+
+1. **Dynamic CLI** (primary) — generated from the cached command manifest. This is what users interact with.
+2. **Static Bridge CLI** (fallback) — a backward-compatible `tool call`, `resource read`, `prompt run` surface used when the dynamic CLI cannot parse input.
+
+The dynamic CLI is always tried first. If it fails, the static bridge catches the command.
+
+---
+
+## See Also
+
+- [Profile Overlays](profile-overlays.md) — customize the generated CLI surface
+- [Fuzzy Matching](fuzzy-matching.md) — typo correction for discovered commands
+- [CLI Reference](../reference/cli-reference.md) — full command listing

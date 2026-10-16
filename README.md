@@ -50,10 +50,10 @@ Listens on `0.0.0.0:9881`, MCP endpoint `/mcp` (streamable HTTP).
 Release Windows builds are static-CRT and windowless (background
 daemon).
 
-Any MCP client works. The CLI face is
-[mcp2cli](https://github.com/mcp2cli/source-code) (Rust; upstream
-targets unix, Windows builds need the cfg gates we carry in
-hvperv-harness):
+Any MCP client works. The CLI face is mcp2cli (Rust). Upstream
+targets unix only; the Windows port patch is vendored in this repo at
+`mcp2cli/` (upstream v0.1.10 + `0001-windows-port.patch`, with its own
+README).
 
 ```
 mcp2cli --url http://<guest-ip>:9881/mcp ls

@@ -1,0 +1,145 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 0 0% 9%;
+    --muted: 0 0% 96%;
+    --muted-foreground: 0 0% 40%;
+    --subtle: 0 0% 98%;
+    --border: 0 0% 90%;
+    --ring: 0 0% 20%;
+    --radius: 0.5rem;
+
+    /* Expressive-code surface tokens. A subtle cool slate tint so
+       code blocks read as a distinct surface rather than blending
+       into the neutral grey palette of the rest of the page. */
+    --code-bg: #eef2f7;
+    --code-chrome: #e1e7ef;
+    --code-hairline: #d6dde6;
+    --code-fg: #383a42;
+    --code-fg-muted: #a0a1a7;
+    --code-ok: #387138;
+
+    /* Match Shiki's one-light palette for bash so the interactive
+       terminal reads as the light-mode counterpart of one-dark-pro:
+       blue commands, orange-brown flags, forest-green strings, soft
+       grey comments, no accent for operators. */
+    --tok-cmd: #3360c1;    /* function / command name — blue         */
+    --tok-flag: #875d01;   /* option (--foo, -x)      — orange-brown */
+    --tok-str: #387138;    /* quoted string           — green        */
+    --tok-url: #387138;    /* url / path              — green        */
+    --tok-op: #383a42;     /* pipe / redirect ops     — default fg   */
+    --tok-com: #646568;    /* comment                 — muted grey   */
+  }
+
+  .dark {
+    --background: 0 0% 6%;
+    --foreground: 0 0% 96%;
+    --muted: 0 0% 12%;
+    --muted-foreground: 0 0% 64%;
+    --subtle: 0 0% 10%;
+    --border: 0 0% 18%;
+    --ring: 0 0% 84%;
+
+    --code-bg: #0a0a0a;
+    --code-chrome: #141414;
+    --code-hairline: #1f1f1f;
+    --code-fg: #abb2bf;
+    --code-fg-muted: #5c6370;
+    --code-ok: #98c379;
+
+    /* Match the one-dark-pro palette Shiki emits for bash so the
+       interactive terminal reads like a VS Code One Dark session —
+       blue commands, orange flags, green strings/paths, subtle grey
+       operators and comments. */
+    --tok-cmd: #61afef;    /* function / command name — blue    */
+    --tok-flag: #d19a66;   /* option (--foo, -x)      — orange  */
+    --tok-str: #98c379;    /* quoted string           — green   */
+    --tok-url: #98c379;    /* url / path              — green   */
+    --tok-op: #abb2bf;     /* pipe / redirect ops     — grey-fg */
+    --tok-com: #9fa3aa;    /* comment                 — grey    */
+  }
+
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  html {
+    color-scheme: light dark;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::selection {
+    background: hsl(var(--foreground));
+    color: hsl(var(--background));
+  }
+
+  /* Keep anchor-link targets out from under the 56px sticky header
+     (plus a bit of breathing room). Applies to every heading — the
+     rehype-generated IDs on docs-page h2/h3 are the primary
+     beneficiaries, but landing-section headings also benefit. */
+  :where(h1, h2, h3, h4, h5, h6)[id] {
+    scroll-margin-top: 5rem;
+  }
+
+  code {
+    font-variant-ligatures: none;
+  }
+}
+
+@layer utilities {
+  @keyframes terminal-blink {
+    50% {
+      opacity: 0;
+    }
+  }
+}
+
+@layer components {
+  .grid-bg {
+    background-image:
+      linear-gradient(to right, hsl(var(--border) / 0.5) 1px, transparent 1px),
+      linear-gradient(to bottom, hsl(var(--border) / 0.5) 1px, transparent 1px);
+    background-size: 48px 48px;
+    mask-image: radial-gradient(ellipse 60% 60% at 50% 0%, black 40%, transparent 100%);
+  }
+}
+
+/* Give every expressive-code block a consistent vertical gap so
+   stacked fences (common in docs and the landing install section)
+   don't visually fuse into one surface. Margins collapse between
+   adjacent blocks to a single 1rem gap. */
+.expressive-code {
+  margin-block: 1rem;
+}
+
+/* Strip expressive-code's decorative terminal titlebar so every
+   fenced code block renders as a plain bordered box — same
+   silhouette as the interactive terminal on the landing, just
+   smaller and without the restart button. The copy button stays
+   (it's a sibling of the figcaption, not a child). */
+.expressive-code .frame > figcaption.header {
+  display: none !important;
+}
+.expressive-code .frame > pre {
+  border-top-left-radius: var(--ec-brdRad) !important;
+  border-top-right-radius: var(--ec-brdRad) !important;
+  border-top: 1px solid var(--code-hairline) !important;
+}
+/* The copy button sits a bit further from the top-right corner
+   now that there's no titlebar to align with. */
+.expressive-code .frame .copy {
+  top: 0.35rem !important;
+  right: 0.35rem !important;
+}

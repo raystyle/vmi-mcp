@@ -36,7 +36,7 @@ vmi-tui --url http://<guest-ip>:9881/mcp [--pane N]
 
 监听 `0.0.0.0:9881`，MCP 端点 `/mcp`（streamable HTTP）。Windows release 构建为静态 CRT、无窗口后台 daemon。
 
-任意 MCP 客户端可接；CLI 面是 [mcp2cli](https://github.com/mcp2cli/source-code)（Rust；上游只编 unix，Windows 构建需 hvperv-harness 侧携带的 cfg 门补丁）：
+任意 MCP 客户端可接；CLI 面是 mcp2cli（Rust）。上游只编 unix；Windows 移植补丁已 vendor 进本仓 `mcp2cli/`（上游 v0.1.10 + `0001-windows-port.patch`，带独立 README）：
 
 ```
 mcp2cli --url http://<guest-ip>:9881/mcp ls

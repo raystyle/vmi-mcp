@@ -1,0 +1,11 @@
+---
+// Landing-page interactive terminal. The heavy-lift lives in
+// InteractiveTerminal.tsx (a React island hydrated on load) — it
+// autoplays an install script, then presents a wizard the reader can
+// navigate with ↑↓/Tab/Enter or click. Picks land as scrollback and
+// the wizard re-appears so the component feels like a real shell.
+// Pattern adapted from https://github.com/tempoxyz/mpp (Apache-2.0).
+import InteractiveTerminal from './InteractiveTerminal';
+---
+
+<InteractiveTerminal client:load />

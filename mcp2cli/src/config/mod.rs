@@ -1,0 +1,1372 @@
+//! Configuration schema and active-config selection.
+//!
+//! Each named MCP server binding lives as a YAML file at
+//! `$XDG_CONFIG_HOME/mcp2cli/configs/<name>.yaml` ([`AppConfig`]).
+//! The active selection (which config `mcp2cli ls/invoke/...`
+//! operates on by default) is persisted at
+//! `$XDG_CONFIG_HOME/mcp2cli/active.yaml`.
+//!
+//! # Loading pipeline
+//!
+//! [`load_active_config`] runs this pipeline:
+//!
+//! 1. Figure out **which** config to load — either an explicit
+//!    `--config <path>` / `MCP2CLI_CONFIG` env, the CLI-invocation
+//!    alias, or the saved active selection.
+//! 2. Parse the YAML with `figment`, layering:
+//!    - Built-in defaults.
+//!    - The YAML file itself.
+//!    - Environment overrides prefixed `MCP2CLI_` (e.g.
+//!      `MCP2CLI_SERVER__ENDPOINT=https://prod.api/mcp`).
+//! 3. Validate the result into a [`ResolvedAppConfig`] — which also
+//!    includes the runtime layout
+//!    ([`RuntimeLayout`]: directories where state, caches, and
+//!    tokens live).
+//!
+//! # Config shape
+//!
+//! The YAML tree maps to [`AppConfig`]:
+//!
+//! - `app.profile` — which profile to apply (overlays rename/hide
+//!   commands). See [`crate::apps::manifest`] for how profiles are
+//!   consumed.
+//! - `server.transport` — `stdio` or `streamable_http`.
+//! - `server.stdio` — command, args, env, cwd when transport is stdio.
+//! - `server.http` — endpoint URL, auth, headers when transport is
+//!   streamable HTTP.
+//! - `defaults` — timeouts, output format, log levels.
+//! - `events` — which [`crate::runtime::EventSink`]s to install (stderr,
+//!   HTTP webhook, Unix socket, SSE server, command exec).
+//! - `roots` — client-advertised root URIs for servers that query them
+//!   via `roots/list`.
+
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, Result, anyhow};
+use directories::ProjectDirs;
+use figment::{
+    Figment,
+    providers::{Env, Format, Serialized, Yaml},
+};
+use serde::{Deserialize, Serialize};
+
+use crate::{mcp::model::TransportKind, output::OutputFormat};
+
+/// Prefix for environment-variable overrides consumed by `figment`.
+///
+/// `MCP2CLI_SERVER__ENDPOINT=https://...` maps to `server.endpoint`
+/// in the config tree (double-underscore is the nesting separator).
+const ENV_PREFIX: &str = "MCP2CLI_";
+
+/// Build the figment env provider for `MCP2CLI_*` overrides.
+///
+/// Excludes the bare `MCP2CLI_TELEMETRY` key: it's documented and
+/// tested as a simple on/off toggle
+/// (`crate::telemetry::TelemetryRecorder::is_enabled`), read directly
+/// from the process environment rather than through this merge. Without
+/// this exclusion, figment sees `MCP2CLI_TELEMETRY` as an override for
+/// the whole nested `telemetry` config *struct* (it shares a name with
+/// that section) and fails to deserialize the string `"off"` as one —
+/// which previously broke config loading outright for any command that
+/// set this env var, defeating the opt-out it was meant to provide.
+/// Nested overrides (`MCP2CLI_TELEMETRY__ENABLED=false`) are unaffected:
+/// `.split("__")` turns those into `"telemetry.enabled"`, which doesn't
+/// match the ignored bare key `"telemetry"`.
+fn env_provider() -> Env {
+    // `branding__version` is read verbatim in `apply_embedded_defaults`: figment
+    // parses env values, and a launcher passing `1.10` means the text, not 1.1.
+    Env::prefixed(ENV_PREFIX)
+        .ignore(&["telemetry", "branding__version"])
+        .split("__")
+}
+
+/// Environment override for `branding.version`, set by launchers.
+const BRANDING_VERSION_ENV: &str = "MCP2CLI_BRANDING__VERSION";
+
+/// Root configuration model for a named MCP server binding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppConfig {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub app: AppBindingConfig,
+    #[serde(default)]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub defaults: DefaultsConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
+    pub plugins: PluginConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
+    pub events: EventConfig,
+    #[serde(default)]
+    pub telemetry: crate::telemetry::TelemetryConfig,
+    /// Optional profile overlay to customize the dynamic CLI surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<crate::apps::manifest::ProfileOverlay>,
+    /// How the command list is obtained: cold-start discovery, a bundled
+    /// snapshot, and cache freshness.
+    #[serde(default, skip_serializing_if = "DiscoveryConfig::is_default")]
+    pub discovery: DiscoveryConfig,
+    /// Present when this config backs a CLI published under its own name.
+    /// Switches the runtime into embedded mode — see [`BrandingConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branding: Option<BrandingConfig>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: default_schema_version(),
+            app: AppBindingConfig::default(),
+            server: ServerConfig::default(),
+            defaults: DefaultsConfig::default(),
+            logging: LoggingConfig::default(),
+            plugins: PluginConfig::default(),
+            auth: AuthConfig::default(),
+            events: EventConfig::default(),
+            telemetry: crate::telemetry::TelemetryConfig::default(),
+            profile: None,
+            discovery: DiscoveryConfig::default(),
+            branding: None,
+        }
+    }
+}
+
+impl AppConfig {
+    pub fn load_named(
+        name: &str,
+        path: Option<&Path>,
+        layout: &RuntimeLayout,
+    ) -> Result<ResolvedAppConfig> {
+        validate_config_name(name)?;
+
+        let config_path = if let Some(path) = path {
+            if !path.exists() {
+                return Err(anyhow!("config file not found: {}", path.display()));
+            }
+            path.to_path_buf()
+        } else {
+            let candidate = layout.named_config_path(name);
+            if !candidate.exists() {
+                return Err(anyhow!(
+                    "config '{}' not found at {}",
+                    name,
+                    candidate.display()
+                ));
+            }
+            candidate
+        };
+
+        let mut figment = Figment::from(Serialized::defaults(AppConfig::default()));
+        figment = figment.merge(Yaml::file(&config_path));
+        figment = figment.merge(env_provider());
+
+        let mut config: AppConfig = figment
+            .extract()
+            .context("failed to load application config")?;
+        config.apply_embedded_defaults(&config_path);
+        config.apply_runtime_defaults(&layout.for_config(&config, name), name);
+        config.validate()?;
+
+        Ok(ResolvedAppConfig {
+            name: name.to_owned(),
+            path: config_path,
+            config,
+        })
+    }
+
+    pub fn scaffold(
+        app_profile: &str,
+        transport: TransportKind,
+        endpoint: Option<String>,
+        stdio_command: Option<String>,
+        stdio_args: Vec<String>,
+    ) -> Self {
+        let mut config = AppConfig::default();
+        config.app.profile = app_profile.to_owned();
+        config.server.display_name = format!("{} MCP Server", app_profile);
+        config.server.transport = transport.clone();
+        config.server.endpoint = match transport {
+            TransportKind::Stdio => None,
+            TransportKind::StreamableHttp => {
+                endpoint.or_else(|| Some("https://demo.invalid/mcp".to_owned()))
+            }
+        };
+        if matches!(transport, TransportKind::Stdio) {
+            config.server.stdio.command = stdio_command;
+            config.server.stdio.args = stdio_args;
+        }
+        config
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version == 0 {
+            return Err(anyhow!("schema_version must be greater than 0"));
+        }
+        self.app.validate()?;
+        self.server.validate()?;
+        self.logging.validate()?;
+        if let Some(branding) = &self.branding {
+            branding.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Settings that depend on where the config file lives, or on which keys
+    /// the file actually sets (as opposed to inheriting a default).
+    fn apply_embedded_defaults(&mut self, config_path: &Path) {
+        // A snapshot path is relative to the config file, so a published
+        // package can ship the two side by side wherever it is installed.
+        if let Some(snapshot) = &self.discovery.snapshot {
+            let snapshot = Path::new(snapshot);
+            if snapshot.is_relative()
+                && let Some(parent) = config_path.parent()
+            {
+                self.discovery.snapshot =
+                    Some(parent.join(snapshot).to_string_lossy().into_owned());
+            }
+        }
+
+        if let Some(branding) = &mut self.branding
+            && let Ok(version) = std::env::var(BRANDING_VERSION_ENV)
+            && !version.trim().is_empty()
+        {
+            branding.version = Some(version);
+        }
+
+        // mcp2cli's own usage telemetry is opt-out for mcp2cli users, but a CLI
+        // published under another name must not report to mcp2cli unless its
+        // publisher asks for that explicitly.
+        if self.branding.is_some() {
+            let explicit = Figment::new()
+                .merge(Yaml::file(config_path))
+                .merge(env_provider());
+            if explicit.find_value("telemetry.enabled").is_err() {
+                self.telemetry.enabled = false;
+            }
+        }
+    }
+
+    fn apply_runtime_defaults(&mut self, layout: &RuntimeLayout, config_name: &str) {
+        if self.auth.token_store_file.is_none() {
+            self.auth.token_store_file = Some(
+                layout
+                    .token_store_path(config_name)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+}
+
+/// Default output format and behavior preferences.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DefaultsConfig {
+    #[serde(default)]
+    pub output: OutputFormat,
+    /// Operation timeout in seconds (0 = no timeout). Default: 120.
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+impl Default for DefaultsConfig {
+    fn default() -> Self {
+        Self {
+            output: OutputFormat::Human,
+            timeout_seconds: default_timeout_seconds(),
+        }
+    }
+}
+
+fn default_timeout_seconds() -> u64 {
+    120
+}
+
+/// Application adapter binding — which built-in profile to use (e.g. `bridge`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppBindingConfig {
+    #[serde(default = "default_app_profile")]
+    pub profile: String,
+}
+
+impl AppBindingConfig {
+    fn validate(&self) -> Result<()> {
+        if self.profile.trim().is_empty() {
+            return Err(anyhow!("app.profile must not be empty"));
+        }
+        Ok(())
+    }
+}
+
+impl Default for AppBindingConfig {
+    fn default() -> Self {
+        Self {
+            profile: default_app_profile(),
+        }
+    }
+}
+
+/// MCP server connection settings — transport kind, endpoint, and stdio subprocess config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerConfig {
+    #[serde(default = "default_server_display_name")]
+    pub display_name: String,
+    #[serde(default = "default_transport_kind")]
+    pub transport: TransportKind,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub stdio: StdioServerConfig,
+    /// MCP protocol version selection: `auto` (default; probe with
+    /// `server/discover` and fall back to the `initialize` handshake),
+    /// `2026-07-28` (stateless, never fall back), or `2025-11-25`
+    /// (legacy handshake, skip the probe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
+}
+
+impl ServerConfig {
+    fn validate(&self) -> Result<()> {
+        if self.display_name.trim().is_empty() {
+            return Err(anyhow!("server.display_name must not be empty"));
+        }
+        crate::mcp::protocol::VersionPolicy::parse(self.protocol_version.as_deref())?;
+        match self.transport {
+            TransportKind::StreamableHttp
+                if self
+                    .endpoint
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty() =>
+            {
+                return Err(anyhow!(
+                    "server.endpoint must be set for streamable_http transport"
+                ));
+            }
+            TransportKind::Stdio => self.stdio.validate()?,
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            display_name: default_server_display_name(),
+            transport: default_transport_kind(),
+            endpoint: Some("https://demo.invalid/mcp".to_owned()),
+            stdio: StdioServerConfig::default(),
+            protocol_version: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct StdioServerConfig {
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+impl StdioServerConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .command
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            return Err(anyhow!(
+                "server.stdio.command must be set for stdio transport"
+            ));
+        }
+        for value in &self.args {
+            if value.trim().is_empty() {
+                return Err(anyhow!("server.stdio.args entries must not be empty"));
+            }
+        }
+        if let Some(cwd) = &self.cwd
+            && cwd.trim().is_empty()
+        {
+            return Err(anyhow!("server.stdio.cwd must not be empty when set"));
+        }
+        for (key, value) in &self.env {
+            if key.trim().is_empty() {
+                return Err(anyhow!("server.stdio.env keys must not be empty"));
+            }
+            if value.trim().is_empty() {
+                return Err(anyhow!("server.stdio.env values must not be empty"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// How the dynamic command surface gets its command list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryConfig {
+    /// Discover the server's capabilities on demand when nothing is cached
+    /// yet, so the first command a user runs already works. Default: true.
+    #[serde(default = "default_discovery_auto")]
+    pub auto: bool,
+    /// Path to an inventory snapshot (written by `mcp2cli package snapshot`),
+    /// relative to the config file. Gives instant, offline `--help` — also
+    /// before login, when the server could not be asked yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    /// Re-discover when the cached command list is older than this many
+    /// seconds. A failed refresh keeps the stale list. Default: never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
+}
+
+impl DiscoveryConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            auto: default_discovery_auto(),
+            snapshot: None,
+            ttl_seconds: None,
+        }
+    }
+}
+
+fn default_discovery_auto() -> bool {
+    true
+}
+
+/// Built-in commands a published CLI can expose through
+/// [`BrandingConfig::builtin_commands`].
+pub const BUILTIN_COMMANDS: &[&str] = &[
+    "auth",
+    "jobs",
+    "doctor",
+    "inspect",
+    "ls",
+    "ping",
+    "log",
+    "complete",
+    "subscribe",
+    "unsubscribe",
+    "tool",
+    "resource",
+    "prompt",
+];
+
+/// Identity of a CLI published on top of mcp2cli under its own name.
+///
+/// The presence of this section switches the runtime into *embedded mode*:
+/// help, `--version`, the OAuth client name and the MCP `clientInfo` carry the
+/// publisher's identity instead of mcp2cli's, state lives in the CLI's own data
+/// directory, mcp2cli's usage telemetry is off unless enabled explicitly, and
+/// the generic mcp2cli surface never shows through.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BrandingConfig {
+    /// Product name. Defaults to the name the CLI was invoked as. Names the
+    /// data directory and identifies the CLI to the server and during login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// One-line description at the top of `--help`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    /// Version reported by `--version` (the published package's version).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_version"
+    )]
+    pub version: Option<String>,
+    /// Free text appended to the top-level `--help` (examples, links).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_help: Option<String>,
+    /// Built-in commands to expose, from [`BUILTIN_COMMANDS`]. `None` exposes
+    /// all of them; an empty list leaves only the server's own commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin_commands: Option<Vec<String>>,
+    /// Append "powered by mcp2cli" to the help header. Default: false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attribution: bool,
+}
+
+/// A version is text. YAML reads an unquoted `1.0` as a number, and turning that
+/// back into text would silently print `1` — so ask for the quotes instead.
+fn deserialize_version<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Version {
+        Text(String),
+        Other(serde::de::IgnoredAny),
+    }
+
+    match Option::<Version>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Version::Text(version)) => Ok(Some(version)),
+        Some(Version::Other(_)) => Err(serde::de::Error::custom(
+            "branding.version must be a string — quote it, e.g. version: \"1.0\"",
+        )),
+    }
+}
+
+impl BrandingConfig {
+    fn validate(&self) -> Result<()> {
+        if let Some(name) = &self.name {
+            validate_config_name(name).context("branding.name is not a valid name")?;
+        }
+        for command in self.builtin_commands.iter().flatten() {
+            if !BUILTIN_COMMANDS.contains(&command.as_str()) {
+                return Err(anyhow!(
+                    "branding.builtin_commands: unknown command '{}' (expected one of: {})",
+                    command,
+                    BUILTIN_COMMANDS.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the built-in command `name` is part of this CLI's surface.
+    pub fn allows_builtin(&self, name: &str) -> bool {
+        self.builtin_commands
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|command| command == name))
+    }
+}
+
+/// Legacy plugin config — kept for backward-compatible deserialization of existing config files.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PluginConfig {
+    #[serde(default)]
+    pub search_dirs: Vec<String>,
+}
+
+/// Authentication configuration — optional browser-open command for OAuth flows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub browser_open_command: Option<String>,
+    #[serde(default)]
+    pub token_store_file: Option<String>,
+}
+
+/// Event delivery configuration — controls which runtime event sinks are active.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventConfig {
+    #[serde(default = "default_enable_stdio_events")]
+    pub enable_stdio_events: bool,
+    #[serde(default)]
+    pub local_socket_path: Option<String>,
+    #[serde(default)]
+    pub http_endpoint: Option<String>,
+    #[serde(default)]
+    pub sse_endpoint: Option<String>,
+    /// Shell command template executed for each event.
+    /// Environment variables: MCP_EVENT_TYPE, MCP_EVENT_JSON, MCP_EVENT_APP_ID, MCP_EVENT_MESSAGE
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+impl Default for EventConfig {
+    fn default() -> Self {
+        Self {
+            enable_stdio_events: default_enable_stdio_events(),
+            local_socket_path: None,
+            http_endpoint: None,
+            sse_endpoint: None,
+            command: None,
+        }
+    }
+}
+
+/// Logging/tracing configuration — level, format, and output targets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoggingConfig {
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    #[serde(default)]
+    pub format: LogFormat,
+    #[serde(default = "default_log_outputs")]
+    pub outputs: Vec<LogOutput>,
+}
+
+impl LoggingConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.level.trim().is_empty() {
+            return Err(anyhow!("logging.level must not be empty"));
+        }
+        if self.outputs.is_empty() {
+            return Err(anyhow!("logging.outputs must not be empty"));
+        }
+        for output in &self.outputs {
+            if let LogOutput::File { path } = output
+                && path.trim().is_empty()
+            {
+                return Err(anyhow!("logging.outputs file paths must not be empty"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: LogFormat::Pretty,
+            outputs: default_log_outputs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    #[default]
+    Pretty,
+    Json,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LogOutput {
+    Stdout,
+    Stderr,
+    File { path: String },
+}
+
+fn default_schema_version() -> u32 {
+    1
+}
+
+fn default_app_profile() -> String {
+    "bridge".to_owned()
+}
+
+fn default_server_display_name() -> String {
+    "Demo MCP Bridge Server".to_owned()
+}
+
+fn default_transport_kind() -> TransportKind {
+    TransportKind::StreamableHttp
+}
+
+fn default_enable_stdio_events() -> bool {
+    true
+}
+
+fn default_log_level() -> String {
+    "warn".to_owned()
+}
+
+fn default_log_outputs() -> Vec<LogOutput> {
+    vec![LogOutput::Stderr]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedAppConfig {
+    pub name: String,
+    pub path: PathBuf,
+    pub config: AppConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamedConfigSummary {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveConfigSelection {
+    pub config_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigCreateOptions {
+    pub name: String,
+    pub app_profile: String,
+    pub transport: TransportKind,
+    pub endpoint: Option<String>,
+    pub stdio_command: Option<String>,
+    pub stdio_args: Vec<String>,
+    /// MCP protocol version selection (`auto`, `2026-07-28`, `2025-11-25`).
+    pub protocol_version: Option<String>,
+    pub force: bool,
+}
+
+/// Platform-resolved directory layout for config, data, and link storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeLayout {
+    pub config_root: PathBuf,
+    pub data_root: PathBuf,
+    pub link_root: PathBuf,
+}
+
+impl RuntimeLayout {
+    pub fn discover() -> Self {
+        let project_dirs = ProjectDirs::from("org", "tsok", "mcp2cli");
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let config_root = std::env::var_os("MCP2CLI_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                project_dirs
+                    .as_ref()
+                    .map(|dirs| dirs.config_dir().to_path_buf())
+            })
+            .unwrap_or_else(|| home.join(".config/mcp2cli"));
+        let data_root = std::env::var_os("MCP2CLI_DATA_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                project_dirs
+                    .as_ref()
+                    .map(|dirs| dirs.data_dir().to_path_buf())
+            })
+            .unwrap_or_else(|| home.join(".local/share/mcp2cli"));
+        let link_root = std::env::var_os("MCP2CLI_BIN_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/bin"));
+
+        Self {
+            config_root,
+            data_root,
+            link_root,
+        }
+    }
+
+    /// The layout a given config runs with. A branded CLI keeps its state in a
+    /// data directory of its own (`~/.local/share/<name>` on Linux) rather than
+    /// in mcp2cli's. This is what keeps its tokens apart from a same-named
+    /// mcp2cli config the user already has — tokens are stored per config name,
+    /// and a published CLI chooses its own name and its own endpoint.
+    ///
+    /// `MCP2CLI_DATA_DIR` relocates the directory but must not undo that: a user
+    /// who exports it for mcp2cli would otherwise hand every branded CLI they
+    /// run the tokens of their own configs. There, a branded CLI gets
+    /// `<dir>/apps/<name>`.
+    pub fn for_config(&self, config: &AppConfig, config_name: &str) -> Self {
+        let Some(branding) = &config.branding else {
+            return self.clone();
+        };
+        let name = branding.name.as_deref().unwrap_or(config_name);
+        let data_root = if std::env::var_os("MCP2CLI_DATA_DIR").is_some() {
+            self.data_root.join("apps").join(name)
+        } else {
+            match ProjectDirs::from("", "", name) {
+                Some(dirs) => dirs.data_dir().to_path_buf(),
+                None => self.data_root.join("apps").join(name),
+            }
+        };
+        Self {
+            data_root,
+            ..self.clone()
+        }
+    }
+
+    pub fn configs_dir(&self) -> PathBuf {
+        self.config_root.join("configs")
+    }
+
+    pub fn named_config_path(&self, name: &str) -> PathBuf {
+        self.configs_dir().join(format!("{}.yaml", name))
+    }
+
+    pub fn state_file_path(&self, name: &str) -> PathBuf {
+        self.data_root
+            .join("instances")
+            .join(name)
+            .join("state.json")
+    }
+
+    pub fn token_store_path(&self, name: &str) -> PathBuf {
+        self.data_root
+            .join("instances")
+            .join(name)
+            .join("tokens.json")
+    }
+
+    pub fn active_config_path(&self) -> PathBuf {
+        self.data_root.join("host").join("active-config.json")
+    }
+
+    pub fn demo_remote_state_path(&self) -> PathBuf {
+        self.data_root.join("demo-remote-state.json")
+    }
+
+    pub fn link_dir(&self) -> PathBuf {
+        self.link_root.clone()
+    }
+
+    /// Default directory for user-level man pages (`man1` section).
+    ///
+    /// Follows the XDG base-directory convention: the `man/man1` subdirectory
+    /// under the XDG data home (typically `~/.local/share/man/man1`).
+    /// Modern `man-db` (Linux) and `man` (macOS) search this path without
+    /// extra `MANPATH` configuration.
+    pub fn man_dir(&self) -> PathBuf {
+        // data_root is e.g. ~/.local/share/mcp2cli
+        // parent()    is     ~/.local/share
+        self.data_root
+            .parent()
+            .map(|base| base.join("man/man1"))
+            .unwrap_or_else(|| PathBuf::from(".local/share/man/man1"))
+    }
+}
+
+pub fn list_named_configs(layout: &RuntimeLayout) -> Result<Vec<NamedConfigSummary>> {
+    let configs_dir = layout.configs_dir();
+    if !configs_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut items = Vec::new();
+    for entry in fs::read_dir(&configs_dir)
+        .with_context(|| format!("failed to read config directory: {}", configs_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", configs_dir.display()))?;
+        let path = entry.path();
+        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if extension != "yaml" && extension != "yml" {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        items.push(NamedConfigSummary {
+            name: name.to_owned(),
+            path,
+        });
+    }
+    items.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(items)
+}
+
+pub fn write_named_config(
+    layout: &RuntimeLayout,
+    options: &ConfigCreateOptions,
+) -> Result<ResolvedAppConfig> {
+    validate_config_name(&options.name)?;
+
+    let path = layout.named_config_path(&options.name);
+    if path.exists() && !options.force {
+        return Err(anyhow!(
+            "config '{}' already exists at {}",
+            options.name,
+            path.display()
+        ));
+    }
+
+    let mut config = AppConfig::scaffold(
+        &options.app_profile,
+        options.transport.clone(),
+        options.endpoint.clone(),
+        options.stdio_command.clone(),
+        options.stdio_args.clone(),
+    );
+    config.server.protocol_version = options
+        .protocol_version
+        .as_deref()
+        .filter(|value| !value.trim().is_empty() && *value != "auto")
+        .map(ToOwned::to_owned);
+    config.apply_runtime_defaults(layout, &options.name);
+    config.validate()?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config directory: {}", parent.display()))?;
+    }
+
+    let yaml = serde_yaml::to_string(&config).context("failed to serialize config as yaml")?;
+    fs::write(&path, yaml)
+        .with_context(|| format!("failed to write config file: {}", path.display()))?;
+
+    Ok(ResolvedAppConfig {
+        name: options.name.clone(),
+        path,
+        config,
+    })
+}
+
+pub fn load_active_config(layout: &RuntimeLayout) -> Result<Option<ActiveConfigSelection>> {
+    let path = layout.active_config_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&path)
+        .with_context(|| format!("failed to read active config file: {}", path.display()))?;
+    let selection: ActiveConfigSelection = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse active config file: {}", path.display()))?;
+    validate_config_name(&selection.config_name)?;
+    Ok(Some(selection))
+}
+
+pub fn write_active_config(layout: &RuntimeLayout, name: &str) -> Result<ActiveConfigSelection> {
+    validate_config_name(name)?;
+
+    let selection = ActiveConfigSelection {
+        config_name: name.to_owned(),
+    };
+    let path = layout.active_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create active config directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let bytes = serde_json::to_vec_pretty(&selection)
+        .context("failed to serialize active config selection")?;
+    fs::write(&path, bytes)
+        .with_context(|| format!("failed to write active config file: {}", path.display()))?;
+
+    Ok(selection)
+}
+
+pub fn clear_active_config(layout: &RuntimeLayout) -> Result<Option<ActiveConfigSelection>> {
+    let path = layout.active_config_path();
+    let selection = load_active_config(layout)?;
+    if path.exists() {
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to remove active config file: {}", path.display()))?;
+    }
+    Ok(selection)
+}
+
+pub fn active_config_load_status(
+    layout: &RuntimeLayout,
+) -> Result<Option<(ActiveConfigSelection, Result<ResolvedAppConfig>)>> {
+    let Some(selection) = load_active_config(layout)? else {
+        return Ok(None);
+    };
+    let loaded = AppConfig::load_named(&selection.config_name, None, layout);
+    Ok(Some((selection, loaded)))
+}
+
+/// Validate that a config name contains only safe filesystem characters.
+pub fn validate_config_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(anyhow!("config name must not be empty"));
+    }
+    // Names become path segments (`instances/<name>`, a branded data directory).
+    if name.chars().all(|ch| ch == '.') {
+        return Err(anyhow!("config name '{}' is not allowed", name));
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(anyhow!(
+            "config name '{}' may only contain ASCII letters, digits, '-', '_' or '.'",
+            name
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("mcp2cli-config-tests.")
+            .tempdir()
+            .expect("tempdir should exist")
+    }
+
+    #[test]
+    fn writes_and_lists_named_configs() {
+        let root = test_tempdir();
+        let layout = RuntimeLayout {
+            config_root: root.path().join("config"),
+            data_root: root.path().join("data"),
+            link_root: root.path().join("bin"),
+        };
+
+        let created = write_named_config(
+            &layout,
+            &ConfigCreateOptions {
+                name: "work".to_owned(),
+                app_profile: "bridge".to_owned(),
+                transport: TransportKind::StreamableHttp,
+                endpoint: Some("https://example.com/mcp".to_owned()),
+                protocol_version: None,
+                stdio_command: None,
+                stdio_args: Vec::new(),
+                force: false,
+            },
+        )
+        .expect("config should be created");
+
+        assert_eq!(created.name, "work");
+        assert_eq!(created.config.app.profile, "bridge");
+
+        let listed = list_named_configs(&layout).expect("configs should list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "work");
+    }
+
+    #[test]
+    fn loads_named_config_with_runtime_defaults() {
+        let root = test_tempdir();
+        let layout = RuntimeLayout {
+            config_root: root.path().join("config"),
+            data_root: root.path().join("data"),
+            link_root: root.path().join("bin"),
+        };
+        write_named_config(
+            &layout,
+            &ConfigCreateOptions {
+                name: "work-http".to_owned(),
+                app_profile: "bridge".to_owned(),
+                transport: TransportKind::StreamableHttp,
+                endpoint: Some("https://example.com/mcp".to_owned()),
+                protocol_version: None,
+                stdio_command: None,
+                stdio_args: Vec::new(),
+                force: false,
+            },
+        )
+        .expect("config should be created");
+
+        let loaded = AppConfig::load_named("work-http", None, &layout).expect("config should load");
+        assert_eq!(
+            loaded.config.auth.token_store_file.as_deref(),
+            Some(
+                layout
+                    .token_store_path("work-http")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(loaded.config.plugins.search_dirs, Vec::<String>::new());
+    }
+
+    /// Serializes the tests below that set, or read a config under,
+    /// `MCP2CLI_TELEMETRY*` — the process environment is shared across the
+    /// test threads.
+    static TELEMETRY_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn telemetry_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        TELEMETRY_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_config(dir: &Path, yaml: &str) -> PathBuf {
+        let path = dir.join("email.yaml");
+        fs::write(&path, yaml).expect("config should be written");
+        path
+    }
+
+    fn test_layout(dir: &Path) -> RuntimeLayout {
+        RuntimeLayout {
+            config_root: dir.join("config"),
+            data_root: dir.join("data"),
+            link_root: dir.join("bin"),
+        }
+    }
+
+    const SERVER: &str =
+        "server:\n  display_name: Acme Mail\n  endpoint: https://mcp.example.com\n";
+
+    #[test]
+    fn branding_turns_mcp2cli_telemetry_off_unless_the_publisher_enables_it() {
+        let _env = telemetry_env_lock();
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let layout = test_layout(dir.path());
+        let load = |yaml: String| {
+            let path = write_config(dir.path(), &yaml);
+            AppConfig::load_named("email", Some(&path), &layout)
+                .expect("config should load")
+                .config
+        };
+
+        // mcp2cli's own users are opted in by default…
+        assert!(load(SERVER.to_owned()).telemetry.enabled);
+        // …a CLI published under another name is not…
+        assert!(
+            !load(format!("{SERVER}branding:\n  name: acme-mail\n"))
+                .telemetry
+                .enabled
+        );
+        // …unless its publisher says so.
+        assert!(
+            load(format!(
+                "{SERVER}branding:\n  name: acme-mail\ntelemetry:\n  enabled: true\n"
+            ))
+            .telemetry
+            .enabled
+        );
+    }
+
+    #[test]
+    fn snapshot_path_is_resolved_next_to_the_config_file() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let path = write_config(
+            dir.path(),
+            &format!("{SERVER}discovery:\n  snapshot: inventory.json\n"),
+        );
+        let config = AppConfig::load_named("email", Some(&path), &test_layout(dir.path()))
+            .expect("config should load")
+            .config;
+        assert_eq!(
+            config.discovery.snapshot.as_deref(),
+            dir.path().join("inventory.json").to_str()
+        );
+        assert!(config.discovery.auto);
+    }
+
+    #[test]
+    fn rejects_an_unknown_builtin_command() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let path = write_config(
+            dir.path(),
+            &format!("{SERVER}branding:\n  builtin_commands: [auth, doktor]\n"),
+        );
+        let error = AppConfig::load_named("email", Some(&path), &test_layout(dir.path()))
+            .expect_err("unknown built-in must be rejected");
+        assert!(error.to_string().contains("'doktor'"), "{error}");
+    }
+
+    #[test]
+    fn only_a_branded_config_gets_a_data_directory_of_its_own() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let layout = test_layout(dir.path());
+        let plain = AppConfig::default();
+        assert_eq!(layout.for_config(&plain, "email"), layout);
+
+        // Whether the root comes from the platform or from MCP2CLI_DATA_DIR, a
+        // branded config never lands in the directory a same-named mcp2cli
+        // config keeps its tokens in.
+        let branded = AppConfig {
+            branding: Some(BrandingConfig {
+                name: Some("acme-mail".to_owned()),
+                ..BrandingConfig::default()
+            }),
+            ..AppConfig::default()
+        };
+        let branded_layout = layout.for_config(&branded, "email");
+        assert_ne!(branded_layout.data_root, layout.data_root);
+        assert!(branded_layout.data_root.ends_with("acme-mail"));
+        assert_ne!(
+            branded_layout.token_store_path("email"),
+            layout.token_store_path("email")
+        );
+        assert_eq!(branded_layout.config_root, layout.config_root);
+    }
+
+    #[test]
+    fn rejects_names_that_would_escape_their_directory() {
+        for name in [".", "..", "..."] {
+            assert!(
+                validate_config_name(name).is_err(),
+                "{name} must be rejected"
+            );
+        }
+        assert!(validate_config_name("instruction.md").is_ok());
+    }
+
+    #[test]
+    fn an_unquoted_numeric_version_is_rejected_with_a_fix() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let layout = test_layout(dir.path());
+        let path = write_config(dir.path(), &format!("{SERVER}branding:\n  version: 1.0\n"));
+        let error = AppConfig::load_named("email", Some(&path), &layout)
+            .expect_err("a numeric version must be rejected");
+        assert!(format!("{error:#}").contains("quote it"), "{error:#}");
+
+        let path = write_config(
+            dir.path(),
+            &format!("{SERVER}branding:\n  version: \"1.0\"\n"),
+        );
+        let config = AppConfig::load_named("email", Some(&path), &layout)
+            .expect("a quoted version should load")
+            .config;
+        assert_eq!(config.branding.unwrap().version.as_deref(), Some("1.0"));
+    }
+
+    /// Regression test: `MCP2CLI_TELEMETRY=off` is documented and tested
+    /// (`telemetry::tests::disabled_by_env`) as a simple on/off toggle,
+    /// read directly from the environment by
+    /// `TelemetryRecorder::is_enabled`. But it shares a name with the
+    /// `telemetry` config section, and figment's env provider used to
+    /// merge it as an override for that whole nested struct — trying to
+    /// deserialize the string `"off"` as a `TelemetryConfig` and failing,
+    /// which broke config loading outright for every command that set
+    /// this env var. `env_provider()` now excludes the bare key.
+    ///
+    /// SAFETY: test-only env mutation, serialized within this module by
+    /// `telemetry_env_lock`. It is not the lock the telemetry/tls module
+    /// tests use for the same variable, so `disabled_by_env` in
+    /// `telemetry::tests` could in principle still interleave — accepted
+    /// here to match this codebase's existing convention for env-var tests.
+    #[test]
+    fn bare_telemetry_env_var_does_not_break_config_loading() {
+        let _env = telemetry_env_lock();
+        let root = test_tempdir();
+        let layout = RuntimeLayout {
+            config_root: root.path().join("config"),
+            data_root: root.path().join("data"),
+            link_root: root.path().join("bin"),
+        };
+        write_named_config(
+            &layout,
+            &ConfigCreateOptions {
+                name: "telemetry-env".to_owned(),
+                app_profile: "bridge".to_owned(),
+                transport: TransportKind::StreamableHttp,
+                endpoint: Some("https://example.com/mcp".to_owned()),
+                protocol_version: None,
+                stdio_command: None,
+                stdio_args: Vec::new(),
+                force: false,
+            },
+        )
+        .expect("config should be created");
+
+        unsafe {
+            std::env::set_var("MCP2CLI_TELEMETRY", "off");
+        }
+        let loaded = AppConfig::load_named("telemetry-env", None, &layout);
+        unsafe {
+            std::env::remove_var("MCP2CLI_TELEMETRY");
+        }
+        loaded.expect("bare MCP2CLI_TELEMETRY=off must not break config loading");
+    }
+
+    #[test]
+    fn nested_telemetry_env_override_still_reaches_the_config() {
+        let _env = telemetry_env_lock();
+        let root = test_tempdir();
+        let layout = RuntimeLayout {
+            config_root: root.path().join("config"),
+            data_root: root.path().join("data"),
+            link_root: root.path().join("bin"),
+        };
+        write_named_config(
+            &layout,
+            &ConfigCreateOptions {
+                name: "telemetry-nested".to_owned(),
+                app_profile: "bridge".to_owned(),
+                transport: TransportKind::StreamableHttp,
+                endpoint: Some("https://example.com/mcp".to_owned()),
+                protocol_version: None,
+                stdio_command: None,
+                stdio_args: Vec::new(),
+                force: false,
+            },
+        )
+        .expect("config should be created");
+
+        unsafe {
+            std::env::set_var("MCP2CLI_TELEMETRY__ENABLED", "false");
+        }
+        let loaded = AppConfig::load_named("telemetry-nested", None, &layout);
+        unsafe {
+            std::env::remove_var("MCP2CLI_TELEMETRY__ENABLED");
+        }
+        assert!(!loaded.expect("config should load").config.telemetry.enabled);
+    }
+
+    #[test]
+    fn writes_stdio_config_with_command_and_args() {
+        let root = test_tempdir();
+        let layout = RuntimeLayout {
+            config_root: root.path().join("config"),
+            data_root: root.path().join("data"),
+            link_root: root.path().join("bin"),
+        };
+
+        let created = write_named_config(
+            &layout,
+            &ConfigCreateOptions {
+                name: "work-stdio".to_owned(),
+                app_profile: "bridge".to_owned(),
+                transport: TransportKind::Stdio,
+                endpoint: None,
+                protocol_version: None,
+                stdio_command: Some("npx".to_owned()),
+                stdio_args: vec!["@modelcontextprotocol/server-everything".to_owned()],
+                force: false,
+            },
+        )
+        .expect("stdio config should be created");
+
+        assert_eq!(created.config.server.transport, TransportKind::Stdio);
+        assert_eq!(created.config.server.stdio.command.as_deref(), Some("npx"));
+        assert_eq!(
+            created.config.server.stdio.args,
+            vec!["@modelcontextprotocol/server-everything".to_owned()]
+        );
+    }
+
+    #[test]
+    fn writes_and_loads_active_config_selection() {
+        let root = test_tempdir();
+        let layout = RuntimeLayout {
+            config_root: root.path().join("config"),
+            data_root: root.path().join("data"),
+            link_root: root.path().join("bin"),
+        };
+
+        write_active_config(&layout, "work").expect("active config should be written");
+
+        let loaded = load_active_config(&layout)
+            .expect("active config should load")
+            .expect("active config should exist");
+        assert_eq!(loaded.config_name, "work");
+    }
+
+    #[test]
+    fn clears_active_config_selection() {
+        let root = test_tempdir();
+        let layout = RuntimeLayout {
+            config_root: root.path().join("config"),
+            data_root: root.path().join("data"),
+            link_root: root.path().join("bin"),
+        };
+
+        write_active_config(&layout, "work").expect("active config should be written");
+        let cleared = clear_active_config(&layout)
+            .expect("active config should clear")
+            .expect("active config should exist before clearing");
+
+        assert_eq!(cleared.config_name, "work");
+        assert!(
+            load_active_config(&layout)
+                .expect("active config load should succeed")
+                .is_none()
+        );
+    }
+}
