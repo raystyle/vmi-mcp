@@ -808,13 +808,17 @@ fn draw(
     hits: &mut Hits,
     log: &[(String, i64, String)],
     show_log: bool,
+    log_focus: bool,
+    log_scroll: usize,
 ) {
     let area = f.area();
-    // shell on top; wait-command transcript block (its own screen,
-    // never mixed into the shell grid); separator; 3-row status
-    let mut cons = vec![Constraint::Min(1)];
+    // two stacked screens: the multiplexed shell workbench on top, the
+    // one-shot command record below (log_list), then the status bar.
+    // Min+Min splits the leftover height evenly.
+    let mut cons = vec![Constraint::Min(4)];
     if show_log {
-        cons.push(Constraint::Length(6)); // transcript
+        cons.push(Constraint::Length(1)); // ── separator
+        cons.push(Constraint::Min(4)); // command record screen
     }
     cons.push(Constraint::Length(1)); // ── separator
     cons.push(Constraint::Length(3)); // status
@@ -829,24 +833,37 @@ fn draw(
         f.render_widget(Paragraph::new("no panes - Ctrl-B c to open"), main);
     }
     if show_log {
-        f.render_widget(transcript_block(log), rows[idx]);
+        f.render_widget(separator(width_of(&rows[idx])), rows[idx]);
+        idx += 1;
+        f.render_widget(transcript_block(log, rows[idx].height, log_focus, log_scroll), rows[idx]);
         idx += 1;
     }
     f.render_widget(separator(width_of(&rows[idx])), rows[idx]);
     idx += 1;
-    let status = status_lines(panes, focus, ctx);
+    let status = status_lines(panes, focus, ctx, log_focus);
     let status_rows = rows[idx];
     f.render_widget(Paragraph::new(status.lines), status_rows);
     hits.chip_hits = status.chip_hits;
     hits.chips_y = status_rows.y;
 }
 
-/// Wait-command transcript: newest records last, dim styling, output
-/// summary indented under each command line.
-fn transcript_block(log: &[(String, i64, String)]) -> Paragraph<'static> {
+/// One-shot command record screen: every log_list entry, newest
+/// last; scroll shows history when the screen holds focus (j/k or
+/// arrows via the main loop).
+fn transcript_block(
+    log: &[(String, i64, String)],
+    height: u16,
+    log_focus: bool,
+    scroll: usize,
+) -> Paragraph<'static> {
+    let badge = if log_focus {
+        " 一次性命令记录 ◀ 焦点（j/k 滚动，Ctrl-B g 回 shell）"
+    } else {
+        " 一次性命令记录（Ctrl-B g 切入）"
+    };
     let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-        " wait 通道命令记录".to_string(),
-        Style::new().fg(Color::DarkGray),
+        badge.to_string(),
+        Style::new().fg(if log_focus { Color::Cyan } else { Color::DarkGray }),
     ))];
     if log.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -854,12 +871,7 @@ fn transcript_block(log: &[(String, i64, String)]) -> Paragraph<'static> {
             Style::new().fg(Color::DarkGray),
         )));
     }
-    let tail = if log.len() > 4 {
-        &log[log.len() - 4..]
-    } else {
-        log
-    };
-    for (cmd, exit, out) in tail {
+    for (cmd, exit, out) in log {
         let mark = if *exit == 0 { "✓" } else { "✗" };
         lines.push(Line::from(vec![
             Span::styled(
@@ -881,7 +893,17 @@ fn transcript_block(log: &[(String, i64, String)]) -> Paragraph<'static> {
             )));
         }
     }
-    Paragraph::new(lines)
+    // viewport: last (height - header - 1) lines, scrolled up by N
+    let usable = (height as usize).saturating_sub(2).max(1);
+    if lines.len() > usable {
+        let max_scroll = lines.len() - usable;
+        let off = scroll.min(max_scroll);
+        let start = lines.len() - usable - off;
+        let shown: Vec<Line> = lines[start..start + usable].to_vec();
+        Paragraph::new(shown)
+    } else {
+        Paragraph::new(lines)
+    }
 }
 
 fn width_of(r: &Rect) -> usize {
@@ -920,12 +942,19 @@ struct StatusRender {
     chip_hits: Vec<(u16, u16)>, // (start_col, end_col) per pane chip
 }
 
-fn status_lines(panes: &[Pane], focus: usize, ctx: &UiCtx) -> StatusRender {
+fn status_lines(panes: &[Pane], focus: usize, ctx: &UiCtx, log_focus: bool) -> StatusRender {
     // row 1: brand + pane chips (focus mark, alive, idle) + endpoint
-    let mut chips = vec![Span::styled(
-        " vmi-tui ".to_string(),
-        Style::new().fg(Color::Black).bg(Color::Cyan),
-    )];
+    let screen_badge = if log_focus { "LOG" } else { "SHELL" };
+    let mut chips = vec![
+        Span::styled(
+            " vmi-tui ".to_string(),
+            Style::new().fg(Color::Black).bg(Color::Cyan),
+        ),
+        Span::styled(
+            format!("[{screen_badge}]"),
+            Style::new().fg(if log_focus { Color::Cyan } else { Color::Green }),
+        ),
+    ];
     if panes.is_empty() {
         chips.push(Span::raw("no panes"));
     }
@@ -1131,6 +1160,8 @@ async fn tui_run(
     let mut last_scan = Instant::now();
     let mut log_entries: Vec<(String, i64, String)> = Vec::new();
     let mut show_log = true;
+    let mut log_focus = false;
+    let mut log_scroll: usize = 0;
     let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut events = crossterm::event::EventStream::new();
@@ -1269,7 +1300,7 @@ async fn tui_run(
         }
 
         // ---- draw ----
-        terminal.draw(|f| draw(f, panes, *focus, ctx, &mut hits, &log_entries, show_log))?;
+        terminal.draw(|f| draw(f, panes, *focus, ctx, &mut hits, &log_entries, show_log, log_focus, log_scroll))?;
 
         // ---- input / tick ----
         let ev = tokio::select! {
@@ -1334,6 +1365,13 @@ async fn tui_run(
                         }
                         crossterm::event::KeyCode::Char('l') => {
                             show_log = !show_log;
+                            if !show_log {
+                                log_focus = false;
+                            }
+                        }
+                        crossterm::event::KeyCode::Char('g') => {
+                            log_focus = !log_focus;
+                            log_scroll = 0;
                         }
                         crossterm::event::KeyCode::Char('x') => {
                             if let Some(p) = panes.get(*focus) {
