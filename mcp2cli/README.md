@@ -1,5 +1,7 @@
 # mcp2cli (vendored, Windows-port patch applied)
 
+English | [简体中文](README.zh-CN.md)
+
 Upstream: https://github.com/mcp2cli/source-code @ v0.1.10
 (Apache-2.0). This tree is a trimmed upstream snapshot (upstream's docs site, nx
 node toolchain and release tooling removed; Rust source, tests and
