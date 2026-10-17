@@ -612,6 +612,53 @@ impl Workbench {
             "exe": args.exe,
         })))
     }
+
+    #[tool(
+        description = "Run a program to completion in the interactive desktop context: argv array (no shell quoting hell), stdout+stderr captured, exit code reported. This is the browse-CLI / dialect-fragment channel: pass the fragment as one argv element"
+    )]
+    async fn run(
+        &self,
+        Parameters(args): Parameters<RunArgs>,
+    ) -> Result<Json<serde_json::Value>, ErrorData> {
+        if args.exe.is_empty() {
+            return Err(err_invalid("exe is required"));
+        }
+        let timeout = Duration::from_secs(args.timeout_s.unwrap_or(60).min(600));
+        let mut cmd = std::process::Command::new(&args.exe);
+        cmd.args(&args.args);
+        if let Some(cwd) = args.cwd.as_deref() {
+            cmd.current_dir(cwd);
+        }
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let out = tokio::time::timeout(timeout, async {
+            match cmd.output() {
+                Ok(o) => Ok((o.stdout, o.stderr, o.status.code().unwrap_or(-1))),
+                Err(e) => Err(err_internal(&format!("run {} failed: {e}", args.exe))),
+            }
+        })
+        .await;
+        match out {
+            Ok(Ok((stdout, stderr, code))) => {
+                let so = String::from_utf8_lossy(&stdout);
+                let se = String::from_utf8_lossy(&stderr);
+                // shell wait 通道同款截断纪律：防巨输出打爆 MCP 回包
+                let mut combined = format!("{}{}", so, se);
+                combined.truncate(30000);
+                Ok(Json(serde_json::json!({
+                    "exit_code": code,
+                    "stdout_bytes": stdout.len(),
+                    "stderr_bytes": stderr.len(),
+                    "stdout": combined,
+                })))
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(err_internal(&format!(
+                "timeout after {}s (kill the process or raise timeout_s)",
+                timeout.as_secs()
+            ))),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1067,6 +1114,21 @@ struct SpawnArgs {
     /// Optional working directory
     #[serde(default)]
     pub cwd: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct RunArgs {
+    /// Executable path
+    pub exe: String,
+    /// argv elements (no shell quoting)
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional working directory
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Kill after this many seconds (default 60, max 600)
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
 }
 
 #[tokio::main]

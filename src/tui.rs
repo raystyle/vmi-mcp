@@ -820,9 +820,9 @@ fn draw(
     let tail = Paragraph::new(vec![status.lines[2].clone()]);
 
     let mut cons = vec![
-        Constraint::Length(2),  // header: status rows 1-2
-        Constraint::Length(1),  // ── separator
-        Constraint::Min(4),     // shell workbench
+        Constraint::Length(2), // header: status rows 1-2
+        Constraint::Length(1), // ── separator
+        Constraint::Min(4),    // shell workbench
     ];
     if show_log {
         cons.push(Constraint::Length(1)); // ── separator
@@ -873,7 +873,11 @@ fn transcript_block(
     };
     let mut lines: Vec<Line> = vec![Line::from(Span::styled(
         badge.to_string(),
-        Style::new().fg(if log_focus { Color::Cyan } else { Color::DarkGray }),
+        Style::new().fg(if log_focus {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }),
     ))];
     if log.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -1310,7 +1314,19 @@ async fn tui_run(
         }
 
         // ---- draw ----
-        terminal.draw(|f| draw(f, panes, *focus, ctx, &mut hits, &log_entries, show_log, log_focus, log_scroll))?;
+        terminal.draw(|f| {
+            draw(
+                f,
+                panes,
+                *focus,
+                ctx,
+                &mut hits,
+                &log_entries,
+                show_log,
+                log_focus,
+                log_scroll,
+            )
+        })?;
 
         // ---- input / tick ----
         let ev = tokio::select! {
