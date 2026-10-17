@@ -631,6 +631,13 @@ impl Workbench {
         }
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // CLI 后台跑：不弹新控制台窗口（GUI 程序仍用 spawn 工具保可见性）
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         let out = tokio::time::timeout(timeout, async {
             match cmd.output() {
                 Ok(o) => Ok((o.stdout, o.stderr, o.status.code().unwrap_or(-1))),
@@ -642,9 +649,10 @@ impl Workbench {
             Ok(Ok((stdout, stderr, code))) => {
                 let so = String::from_utf8_lossy(&stdout);
                 let se = String::from_utf8_lossy(&stderr);
-                // shell wait 通道同款截断纪律：防巨输出打爆 MCP 回包
+                // shell wait 通道同款截断纪律：防巨输出打爆 MCP 回包（max_out 可调）
+                let cap = args.max_out.unwrap_or(65536).min(512_000) as usize;
                 let mut combined = format!("{}{}", so, se);
-                combined.truncate(30000);
+                combined.truncate(cap);
                 Ok(Json(serde_json::json!({
                     "exit_code": code,
                     "stdout_bytes": stdout.len(),
@@ -1129,6 +1137,9 @@ struct RunArgs {
     /// Kill after this many seconds (default 60, max 600)
     #[serde(default)]
     pub timeout_s: Option<u64>,
+    /// Max captured stdout+stderr bytes before truncation (default 65536, max 512000)
+    #[serde(default)]
+    pub max_out: Option<u64>,
 }
 
 #[tokio::main]
