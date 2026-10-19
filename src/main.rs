@@ -53,6 +53,8 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, schemars, tool, tool_router};
 
+mod pipe;
+
 const BIND_ADDRESS: &str = "0.0.0.0:9881";
 const SCROLLBACK_CAP: usize = 4 * 1024 * 1024;
 
@@ -130,6 +132,83 @@ impl Workbench {
             "uptime_s": self.started.map(|s| s.elapsed().as_secs()).unwrap_or(0),
             "panes": panes,
         }))
+    }
+
+    #[tool(
+        description = "Windows Firewall diagnostic (the 'daemon up, port dead' pre-flight): per-profile state (Domain/Private/Public), inbound default action, and whether the given TCP port (default 9881) has an inbound allow rule. verdict=reachable|blocked"
+    )]
+    async fn fw_status(
+        &self,
+        Parameters(args): Parameters<FwStatusArgs>,
+    ) -> Result<Json<serde_json::Value>, ErrorData> {
+        let port = args.port.unwrap_or(9881);
+        #[cfg(not(windows))]
+        {
+            let _ = port;
+            return Ok(Json(
+                serde_json::json!({ "applicable": false, "os": "not windows" }),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            // One Windows PowerShell spawn (NetSecurity module is built-in
+            // there); pure read, no admin needed. Port-filter enumeration
+            // walks every rule, so keep a generous but bounded timeout.
+            let script = format!(
+                r#"$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+$port='{0}'
+$out=[ordered]@{{ port=$port }}
+$out.profiles=@(Get-NetFirewallProfile | ForEach-Object {{ [ordered]@{{ name=$_.Name; enabled=$_.Enabled; default_inbound=[string]$_.DefaultInboundAction }} }})
+$hits=@()
+foreach ($r in (Get-NetFirewallRule -Enabled True -Direction Inbound -Action Allow -ErrorAction SilentlyContinue)) {{
+  $f=$r | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+  if ($f -and ($f.Protocol -eq 'TCP' -or $f.Protocol -eq 'Any') -and (@($f.LocalPort) -contains $port -or @($f.LocalPort) -contains 'Any')) {{
+    $hits += [ordered]@{{ name=$r.DisplayName; program=[string]$r.Program }}
+  }}
+}}
+$out.allow_rules=$hits
+$blocking=@($out.profiles | Where-Object {{ $_.enabled -and $_.default_inbound -ne 'Allow' }})
+$out.blocked_by_default = @($blocking).Count -gt 0
+$out.verdict = if ($out.blocked_by_default -and $hits.Count -eq 0) {{ 'blocked' }} else {{ 'reachable' }}
+$out | ConvertTo-Json -Depth 4 -Compress
+"#,
+                port
+            );
+            let mut cmd = std::process::Command::new("powershell");
+            cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            let timeout = Duration::from_secs(90);
+            let out = tokio::time::timeout(timeout, async { cmd.output() }).await;
+            match out {
+                Ok(Ok(o)) if o.status.success() => {
+                    let text = String::from_utf8_lossy(&o.stdout);
+                    match serde_json::from_str::<serde_json::Value>(text.trim()) {
+                        Ok(v) => Ok(Json(v)),
+                        Err(_) => Err(err_internal(&format!(
+                            "firewall check returned non-JSON (len {}): {}",
+                            text.len(),
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        ))),
+                    }
+                }
+                Ok(Ok(o)) => Err(err_internal(&format!(
+                    "firewall check failed (exit {}): {}",
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ))),
+                Ok(Err(e)) => Err(err_internal(&format!("powershell spawn failed: {e}"))),
+                Err(_) => Err(err_internal(
+                    "firewall check timed out after 90s (port-filter enumeration is slow; retry)",
+                )),
+            }
+        }
     }
 
     #[tool(
@@ -1142,8 +1221,58 @@ struct RunArgs {
     pub max_out: Option<u64>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FwStatusArgs {
+    /// TCP port to check inbound reachability for (default: the MCP bind port 9881)
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Hand-rolled argv (no clap for a handful of flags): one binary, two
+    // run modes.
+    //   vmi  (default) — workbench: HTTP :9881 + local pipe
+    //   jobd            — headless PowerShell job daemon (v0.8.0)
+    //     --mode vmi|jobd   --pipe NAME   --ops-dir DIR   --queue-dir DIR
+    //     --bind ADDR (vmi HTTP bind, default 0.0.0.0:9881)
+    let mut mode: Option<String> = None;
+    let mut pipe_name: Option<String> = None;
+    let mut ops_dir: Option<String> = None;
+    let mut queue_dir: Option<String> = None;
+    let mut bind: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        let mut value = |slot: &mut Option<String>, what: &str| -> anyhow::Result<()> {
+            match args.next() {
+                Some(v) => {
+                    *slot = Some(v);
+                    Ok(())
+                }
+                None => anyhow::bail!("missing value for {what}"),
+            }
+        };
+        match flag.as_str() {
+            "--mode" => value(&mut mode, "--mode")?,
+            "--pipe" => value(&mut pipe_name, "--pipe")?,
+            "--ops-dir" => value(&mut ops_dir, "--ops-dir")?,
+            "--queue-dir" => value(&mut queue_dir, "--queue-dir")?,
+            "--bind" => value(&mut bind, "--bind")?,
+            other => anyhow::bail!("unknown flag: {other}"),
+        }
+    }
+    let mode = mode.as_deref().unwrap_or("vmi");
+    match mode {
+        "vmi" => run_vmi(pipe_name, bind).await,
+        "jobd" => {
+            let _ = (ops_dir, queue_dir);
+            anyhow::bail!("jobd mode arrives in v0.8.0 (not in this build)")
+        }
+        other => anyhow::bail!("unknown --mode: {other} (expected vmi|jobd)"),
+    }
+}
+
+async fn run_vmi(pipe_name: Option<String>, bind: Option<String>) -> anyhow::Result<()> {
     let ct = tokio_util::sync::CancellationToken::new();
     // callers reach us by guest IP: allow every host form this machine
     // can present (rmcp's dns-rebinding guard rejects unlisted hosts).
@@ -1170,6 +1299,13 @@ async fn main() -> anyhow::Result<()> {
     let started = Instant::now();
     let wait_log: Arc<Mutex<std::collections::VecDeque<WaitLog>>> =
         Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    // Pipe-face state clones must happen BEFORE the HTTP factory moves the
+    // Arcs (the closure is 'static).
+    let pipe_state = (
+        Arc::clone(&panes),
+        Arc::clone(&next_id),
+        Arc::clone(&wait_log),
+    );
     let service = StreamableHttpService::new(
         move || {
             Ok(Workbench {
@@ -1183,13 +1319,43 @@ async fn main() -> anyhow::Result<()> {
         config,
     );
     let router = axum::Router::new().nest_service("/mcp", service);
-    let listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
-    eprintln!("vmi-mcp v0.7.2 listening on http://{BIND_ADDRESS}/mcp");
+    let bind_addr = bind.unwrap_or_else(|| BIND_ADDRESS.to_string());
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    eprintln!("vmi-mcp v0.7.2 listening on http://{bind_addr}/mcp");
+
+    // Local pipe face: same workbench, stdio-framed MCP over a named
+    // pipe / unix socket. Local programs skip HTTP entirely.
+    let pipe_addr = pipe_name.unwrap_or_else(default_pipe_name);
+    let pipe_ct = ct.child_token();
+    let pipe_task = tokio::spawn(async move {
+        let (panes, next_id, wait_log) = pipe_state;
+        let factory: pipe::HandlerFactory = Arc::new(move || Workbench {
+            started: None,
+            panes: Arc::clone(&panes),
+            next_id: Arc::clone(&next_id),
+            wait_log: Arc::clone(&wait_log),
+        });
+        if let Err(e) = pipe::listen(&pipe_addr, factory, pipe_ct).await {
+            eprintln!("pipe listener failed: {e}");
+        }
+    });
+
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
             ct.cancel();
         })
         .await?;
+    let _ = pipe_task.abort();
     Ok(())
+}
+
+#[cfg(windows)]
+fn default_pipe_name() -> String {
+    r"\\.\pipe\vmi-mcp".to_string()
+}
+
+#[cfg(not(windows))]
+fn default_pipe_name() -> String {
+    "/tmp/vmi-mcp.sock".to_string()
 }

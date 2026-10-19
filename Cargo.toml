@@ -14,7 +14,7 @@ rmcp = { version = "3", features = [
     "transport-streamable-http-client-reqwest",
     "schemars",
 ] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-std", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-std", "io-util", "net", "time"] }
 tokio-util = "0.7"
 tokio-stream = "0.1"
 serde = { version = "1", features = ["derive"] }
