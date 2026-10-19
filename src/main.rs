@@ -53,6 +53,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, schemars, tool, tool_router};
 
+mod jobd;
 mod pipe;
 
 const BIND_ADDRESS: &str = "0.0.0.0:9881";
@@ -110,15 +111,6 @@ struct Workbench {
 
 #[tool_router(server_handler)]
 impl Workbench {
-    fn new() -> Self {
-        Self {
-            started: Some(Instant::now()),
-            panes: Arc::new(Mutex::new(HashMap::new())),
-            next_id: Arc::new(Mutex::new(1)),
-            wait_log: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-        }
-    }
-
     #[tool(
         description = "Workbench heartbeat: pid, session id, session name, user, uptime, open panes"
     )]
@@ -1265,8 +1257,13 @@ async fn main() -> anyhow::Result<()> {
     match mode {
         "vmi" => run_vmi(pipe_name, bind).await,
         "jobd" => {
-            let _ = (ops_dir, queue_dir);
-            anyhow::bail!("jobd mode arrives in v0.8.0 (not in this build)")
+            let ops_dir = ops_dir
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("jobd requires --ops-dir"))?;
+            let queue_dir = queue_dir
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("jobd requires --queue-dir"))?;
+            jobd::run_jobd(ops_dir, queue_dir, pipe_name).await
         }
         other => anyhow::bail!("unknown --mode: {other} (expected vmi|jobd)"),
     }
@@ -1321,7 +1318,7 @@ async fn run_vmi(pipe_name: Option<String>, bind: Option<String>) -> anyhow::Res
     let router = axum::Router::new().nest_service("/mcp", service);
     let bind_addr = bind.unwrap_or_else(|| BIND_ADDRESS.to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    eprintln!("vmi-mcp v0.7.2 listening on http://{bind_addr}/mcp");
+    eprintln!("vmi-mcp v0.8.0 listening on http://{bind_addr}/mcp");
 
     // Local pipe face: same workbench, stdio-framed MCP over a named
     // pipe / unix socket. Local programs skip HTTP entirely.
@@ -1329,13 +1326,13 @@ async fn run_vmi(pipe_name: Option<String>, bind: Option<String>) -> anyhow::Res
     let pipe_ct = ct.child_token();
     let pipe_task = tokio::spawn(async move {
         let (panes, next_id, wait_log) = pipe_state;
-        let factory: pipe::HandlerFactory = Arc::new(move || Workbench {
+        let factory = move || Workbench {
             started: None,
             panes: Arc::clone(&panes),
             next_id: Arc::clone(&next_id),
             wait_log: Arc::clone(&wait_log),
-        });
-        if let Err(e) = pipe::listen(&pipe_addr, factory, pipe_ct).await {
+        };
+        if let Err(e) = pipe::listen(&pipe_addr, None, factory, pipe_ct).await {
             eprintln!("pipe listener failed: {e}");
         }
     });
