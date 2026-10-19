@@ -20,19 +20,19 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 use rmcp::model::{CallToolRequestParams, CallToolResponse, ClientConfig, JsonObject};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use rmcp::transport::{
-    streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
+    StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_stream::StreamExt;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -655,11 +655,7 @@ fn ansi256(n: u16) -> Color {
             let n = n - 16;
             let c = |x: u16| -> u8 {
                 let step = x / 36;
-                if step == 0 {
-                    0
-                } else {
-                    (step * 40 + 55) as u8
-                }
+                if step == 0 { 0 } else { (step * 40 + 55) as u8 }
             };
             Color::Rgb(c(n / 36), c((n % 36) / 6), c(n % 6))
         }
@@ -1045,7 +1041,9 @@ fn parse_args() -> Result<Args> {
             "--url" => url = Some(it.next().context("--url needs a value")?),
             "--pane" => pane = Some(it.next().context("--pane needs an id")?.parse()?),
             "--self-test" => self_test = true,
-            _ => bail!("unknown arg {a}; usage: vmi-tui [--url http://ip:9881/mcp] [--pane N] [--self-test]"),
+            _ => bail!(
+                "unknown arg {a}; usage: vmi-tui [--url http://ip:9881/mcp] [--pane N] [--self-test]"
+            ),
         }
     }
     Ok(Args {

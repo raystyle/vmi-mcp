@@ -51,7 +51,7 @@ use rmcp::handler::server::wrapper::Json;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{schemars, tool, tool_router, ErrorData};
+use rmcp::{ErrorData, schemars, tool, tool_router};
 
 const BIND_ADDRESS: &str = "0.0.0.0:9881";
 const SCROLLBACK_CAP: usize = 4 * 1024 * 1024;
