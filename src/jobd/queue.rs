@@ -337,7 +337,13 @@ impl Queue {
                     ct.cancel();
                     break;
                 }
-                tokio::time::sleep(HEARTBEAT_PERIOD).await;
+                // cancellable sleep: a stop must wake us immediately so
+                // the heartbeat file is removed before the exit monitor
+                // reaps the process (a plain sleep would race it)
+                tokio::select! {
+                    _ = tokio::time::sleep(HEARTBEAT_PERIOD) => {}
+                    _ = ct.cancelled() => {}
+                }
             }
             // remove the heartbeat file on exit (same as daemon.ps1)
             let _ = std::fs::remove_file(q.dir.join("daemon.json"));

@@ -307,7 +307,9 @@ pub async fn run_jobd(
         tokio::spawn(async move {
             ct.cancelled().await;
             worker.shutdown().await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // grace must exceed the watchdog's in-flight heartbeat write
+            // (cancellable select sleep) so the file is gone before exit
+            tokio::time::sleep(Duration::from_millis(1000)).await;
             let _ = std::fs::remove_file(queue_dir.join("daemon.json"));
             std::process::exit(0);
         });
