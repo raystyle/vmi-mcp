@@ -14,14 +14,20 @@
 //! heartbeat-staleness guess).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
+
+use super::poison_lock;
 
 pub const RESULT_KEEP: usize = 100;
 const HEARTBEAT_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+/// Extra slack past a job's recorded timeout before the supervisor reaps
+/// it: the dispatcher itself gets timeout + kill margin to finish the op
+/// normally, so a reap only fires when it is genuinely wedged.
+const REAP_GRACE_S: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum State {
@@ -50,9 +56,25 @@ struct Job {
     submitted_at: String,
     started_at: Option<String>,
     finished_at: Option<String>,
+    /// execution timeout (seconds) — set at mark_running, consumed by the
+    /// stale-job supervisor
+    timeout_secs: u64,
+    started_instant: Option<std::time::Instant>,
 }
 
 impl Job {
+    fn new(op: String) -> Self {
+        Self {
+            op,
+            state: State::Pending,
+            envelope: None,
+            submitted_at: now_iso(),
+            started_at: None,
+            finished_at: None,
+            timeout_secs: 600,
+            started_instant: None,
+        }
+    }
     fn to_public(&self, id: &str) -> Value {
         let mut v = json!({
             "id": id,
@@ -103,6 +125,8 @@ pub struct Queue {
     boot_nonce: u32,
     started: std::time::Instant,
     pwsh_version: String,
+    /// supervisor reaped-job total (surfaced in daemon_status for doctor)
+    reaped_count: AtomicUsize,
     pub done_count: std::sync::atomic::AtomicUsize,
 }
 
@@ -122,6 +146,7 @@ impl Queue {
             boot_nonce,
             started: std::time::Instant::now(),
             pwsh_version,
+            reaped_count: AtomicUsize::new(0),
             done_count: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
@@ -133,36 +158,97 @@ impl Queue {
 
     pub fn submit(&self, id: &str, op: &str) {
         self.log(&format!("job {id} submitted: {op}"));
-        self.jobs.lock().unwrap().insert(
-            id.to_string(),
-            Job {
-                op: op.to_string(),
-                state: State::Pending,
-                envelope: None,
-                submitted_at: now_iso(),
-                started_at: None,
-                finished_at: None,
-            },
-        );
+        poison_lock(&self.jobs).insert(id.to_string(), Job::new(op.to_string()));
     }
 
-    pub fn mark_running(&self, id: &str) {
-        let mut jobs = self.jobs.lock().unwrap();
-        if let Some(j) = jobs.get_mut(id) {
-            j.state = State::Running;
-            j.started_at = Some(now_iso());
+    /// pending -> running, recording the execution deadline the supervisor
+    /// enforces. Returns false when the job is no longer pending (cancelled
+    /// while queued) so the dispatcher skips it instead of running a
+    /// cancelled op.
+    pub fn mark_running(&self, id: &str, timeout_secs: u64) -> bool {
+        let mut jobs = poison_lock(&self.jobs);
+        match jobs.get_mut(id) {
+            Some(j) if j.state == State::Pending => {
+                j.state = State::Running;
+                j.timeout_secs = timeout_secs;
+                j.started_instant = Some(std::time::Instant::now());
+                j.started_at = Some(now_iso());
+                true
+            }
+            _ => false,
         }
     }
 
+    /// Supervisor: force-finish running jobs that blew past their
+    /// execution timeout + grace. Root-cause hardening for the observed
+    /// "stuck running forever" dispatcher disease (2026-10-19/20): whatever
+    /// stalls the normal completion path — worker tree wedged mid-kill,
+    /// dispatcher task lost — this converts the stall into a terminal
+    /// op_timeout envelope so waiters always get closure and the queue
+    /// keeps draining. Returns the reaped job ids.
+    pub fn reap_stale(&self, grace_secs: u64) -> Vec<String> {
+        let reaped: Vec<(String, Value)> = {
+            let mut jobs = poison_lock(&self.jobs);
+            let now = std::time::Instant::now();
+            let stale: Vec<String> = jobs
+                .iter()
+                .filter(|(_, j)| {
+                    j.state == State::Running
+                        && j.started_instant
+                            .map(|t| now.duration_since(t).as_secs() > j.timeout_secs + grace_secs)
+                            .unwrap_or(false)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            stale
+                .into_iter()
+                .filter_map(|id| {
+                    let j = jobs.get_mut(&id)?;
+                    j.state = State::Done;
+                    j.finished_at = Some(now_iso());
+                    j.envelope = Some(json!({
+                        "ok": false,
+                        "error": {
+                            "code": "op_timeout",
+                            "message": format!(
+                                "job reaped by supervisor: ran > {}s (timeout {}s + grace {}s)",
+                                j.timeout_secs + grace_secs, j.timeout_secs, grace_secs
+                            ),
+                        }
+                    }));
+                    let artifact = j.to_public(&id);
+                    Some((id, artifact))
+                })
+                .collect()
+        };
+        // artifacts + logging outside the lock
+        for (id, artifact) in &reaped {
+            self.log(&format!("job {id} reaped by supervisor (op_timeout)"));
+            self.write_result(id, artifact);
+        }
+        self.reaped_count.fetch_add(reaped.len(), Ordering::Relaxed);
+        reaped.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// running -> done with the worker's envelope. A job already terminal
+    /// (supervisor-reaped or cancelled) keeps its first verdict — a late
+    /// normal finish must not resurrect a reaped job.
     pub fn finish(&self, id: &str, envelope: Value) {
         let artifact = {
-            let mut jobs = self.jobs.lock().unwrap();
+            let mut jobs = poison_lock(&self.jobs);
             match jobs.get_mut(id) {
-                Some(j) => {
+                Some(j) if j.state == State::Running => {
                     j.state = State::Done;
                     j.finished_at = Some(now_iso());
                     j.envelope = Some(envelope.clone());
                     j.to_public(id)
+                }
+                Some(j) => {
+                    self.log(&format!(
+                        "job {id} finish dropped: already {} (supervisor won)",
+                        j.state.as_str()
+                    ));
+                    return;
                 }
                 None => return,
             }
@@ -173,7 +259,7 @@ impl Queue {
 
     /// pending -> cancelled; running/done/cancelled reported as-is.
     pub fn cancel(&self, id: &str) -> (bool, &'static str) {
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = poison_lock(&self.jobs);
         match jobs.get_mut(id) {
             Some(j) if j.state == State::Pending => {
                 j.state = State::Cancelled;
@@ -186,12 +272,12 @@ impl Queue {
     }
 
     pub fn status(&self, id: &str) -> Option<Value> {
-        let jobs = self.jobs.lock().unwrap();
+        let jobs = poison_lock(&self.jobs);
         jobs.get(id).map(|j| j.to_public(id))
     }
 
     pub fn list(&self) -> Vec<Value> {
-        let jobs = self.jobs.lock().unwrap();
+        let jobs = poison_lock(&self.jobs);
         let mut out: Vec<Value> = jobs.iter().map(|(id, j)| j.to_public(id)).collect();
         out.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         out
@@ -249,7 +335,7 @@ impl Queue {
     }
 
     pub fn counts(&self) -> (usize, usize, usize) {
-        let jobs = self.jobs.lock().unwrap();
+        let jobs = poison_lock(&self.jobs);
         let pending = jobs.values().filter(|j| j.state == State::Pending).count();
         let running = jobs.values().filter(|j| j.state == State::Running).count();
         (pending, running, self.done_count.load(Ordering::Relaxed))
@@ -264,6 +350,7 @@ impl Queue {
             "pwsh_version": self.pwsh_version,
             "mode": "jobd",
             "worker": {"alive": worker_alive, "born_at": worker_born_at},
+            "supervisor": {"reaped": self.reaped_count.load(Ordering::Relaxed)},
             "queue": {"pending": pending, "running": running, "done": done},
         })
     }
@@ -319,7 +406,10 @@ impl Queue {
         false
     }
 
-    /// Spawn the heartbeat + control watchdog loop.
+    /// Spawn the heartbeat + control watchdog loop. Each tick also runs the
+    /// stale-job supervisor: reaped jobs get terminal op_timeout envelopes,
+    /// and the in-flight worker tree is killed so a dispatcher parked on
+    /// its roundtrip wakes up (EOF -> error path -> next op cold-boots).
     pub fn spawn_watchdog(
         self: &Arc<Self>,
         worker: Arc<crate::jobd::worker::WorkerSlot>,
@@ -330,6 +420,16 @@ impl Queue {
             loop {
                 if ct.is_cancelled() {
                     break;
+                }
+                let reaped = q.reap_stale(REAP_GRACE_S);
+                if !reaped.is_empty() {
+                    let killed = worker.kill_running().await;
+                    q.log(&format!(
+                        "supervisor: reaped {} job(s) [{}], in-flight worker killed: {}",
+                        reaped.len(),
+                        reaped.join(","),
+                        killed
+                    ));
                 }
                 let (alive, born) = worker.snapshot();
                 q.write_heartbeat(alive, born);
@@ -375,7 +475,7 @@ mod tests {
         let q = Queue::new(dir.clone(), "7.5.0".into()).unwrap();
         q.submit("j1", "vm-list");
         assert_eq!(q.status("j1").unwrap()["state"], "pending");
-        q.mark_running("j1");
+        assert!(q.mark_running("j1", 600));
         assert_eq!(q.status("j1").unwrap()["state"], "running");
         q.finish("j1", json!({"ok": true, "data": []}));
         let st = q.status("j1").unwrap();
@@ -403,14 +503,67 @@ mod tests {
         // second cancel of a cancelled job: not cancelled again
         let (ok, state) = q.cancel("p1");
         assert!((ok, state) == (false, "cancelled"));
+        // a job cancelled while queued is never dispatched
+        assert!(!q.mark_running("p1", 600));
         // running jobs are reported, not preempted (serial worker)
         q.submit("r1", "vm-status");
-        q.mark_running("r1");
+        assert!(q.mark_running("r1", 600));
         let (ok, state) = q.cancel("r1");
         assert!((ok, state) == (false, "running"));
         // unknown id
         let (ok, state) = q.cancel("nope");
         assert!((ok, state) == (false, "unknown"));
+    }
+
+    #[test]
+    fn reap_stale_force_finishes_wedged_running_jobs() {
+        let dir = temp_dir("reap");
+        let q = Queue::new(dir.clone(), "7.5.0".into()).unwrap();
+        q.submit("w1", "vm-wait-state");
+        assert!(q.mark_running("w1", 0)); // timeout 0: stale as soon as time passes
+                                          // within grace: untouched
+        assert!(q.reap_stale(600).is_empty());
+        assert_eq!(q.status("w1").unwrap()["state"], "running");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // past timeout + grace: forced terminal with op_timeout evidence
+        let reaped = q.reap_stale(0);
+        assert_eq!(reaped, vec!["w1".to_string()]);
+        let st = q.status("w1").unwrap();
+        assert_eq!(st["state"], "done");
+        assert_eq!(st["envelope"]["error"]["code"], "op_timeout");
+        // the artifact landed on disk like any terminal job
+        let raw = std::fs::read_to_string(dir.join("done").join("w1.result.json")).unwrap();
+        let artifact: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(artifact["envelope"]["error"]["code"], "op_timeout");
+    }
+
+    #[test]
+    fn late_finish_after_reap_does_not_resurrect() {
+        let dir = temp_dir("late");
+        let q = Queue::new(dir, "7.5.0".into()).unwrap();
+        q.submit("w2", "vm-list");
+        assert!(q.mark_running("w2", 0));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_eq!(q.reap_stale(0).len(), 1);
+        // the dispatcher eventually unwinds with the real (stale) envelope:
+        // the supervisor's terminal verdict wins
+        q.finish("w2", json!({"ok": true, "data": []}));
+        let st = q.status("w2").unwrap();
+        assert_eq!(st["state"], "done");
+        assert_eq!(st["envelope"]["error"]["code"], "op_timeout");
+    }
+
+    #[test]
+    fn healthy_running_job_is_not_reaped() {
+        let dir = temp_dir("healthy");
+        let q = Queue::new(dir, "7.5.0".into()).unwrap();
+        q.submit("h1", "vm-list");
+        assert!(q.mark_running("h1", 600));
+        assert!(q.reap_stale(REAP_GRACE_S).is_empty());
+        assert_eq!(q.status("h1").unwrap()["state"], "running");
+        // and it can still finish normally afterwards
+        q.finish("h1", json!({"ok": true}));
+        assert_eq!(q.status("h1").unwrap()["envelope"]["ok"], true);
     }
 
     #[test]
@@ -420,6 +573,7 @@ mod tests {
         for i in 0..105 {
             let id = format!("g{i:03}");
             q.submit(&id, "noop");
+            assert!(q.mark_running(&id, 600));
             q.finish(&id, json!({"ok": true, "seq": i}));
         }
         let remaining = std::fs::read_dir(dir.join("done")).unwrap().count();

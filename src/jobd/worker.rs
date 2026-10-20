@@ -11,10 +11,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use serde_json::{Value, json};
+use base64::Engine;
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+use super::poison_lock;
 
 /// worker stderr lines kept for protocol-failure diagnostics (worker.ps1
 /// owns op-level error capture; this tail explains worker-level deaths)
@@ -33,6 +35,10 @@ pub struct WorkerSlot {
     script: std::path::PathBuf,
     worker: Mutex<Option<Worker>>,
     born_at: Mutex<Option<String>>,
+    /// pid of the worker child currently mid-op (0 = idle). The stale-job
+    /// supervisor kills by pid because a wedged exec owns the Worker
+    /// object on its stack — the slot itself holds None then.
+    running_pid: Mutex<u32>,
     stderr_tail: Arc<Mutex<Vec<String>>>,
 }
 
@@ -43,14 +49,15 @@ impl WorkerSlot {
             script,
             worker: Mutex::new(None),
             born_at: Mutex::new(None),
+            running_pid: Mutex::new(0),
             stderr_tail: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
     pub fn snapshot(&self) -> (bool, Option<String>) {
         (
-            self.worker.lock().unwrap().is_some(),
-            self.born_at.lock().unwrap().clone(),
+            poison_lock(&self.worker).is_some(),
+            poison_lock(&self.born_at).clone(),
         )
     }
 
@@ -63,7 +70,7 @@ impl WorkerSlot {
             Some(w) => w,
             None => match self.spawn_worker() {
                 Ok(w) => {
-                    *self.born_at.lock().unwrap() = Some(crate::jobd::queue::now_iso());
+                    *poison_lock(&self.born_at) = Some(crate::jobd::queue::now_iso());
                     w
                 }
                 Err(msg) => {
@@ -74,12 +81,14 @@ impl WorkerSlot {
                 }
             },
         };
+        *poison_lock(&self.running_pid) = worker.pid().unwrap_or(0);
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let line = B64.encode(serde_json::to_string(request).unwrap_or_default());
-        match worker
+        let outcome = worker
             .roundtrip(&line, &id, timeout, &self.stderr_tail)
-            .await
-        {
+            .await;
+        *poison_lock(&self.running_pid) = 0;
+        match outcome {
             Ok(envelope) => {
                 self.put_back(worker);
                 Ok(envelope)
@@ -92,11 +101,11 @@ impl WorkerSlot {
     }
 
     fn take(&self) -> Option<Worker> {
-        self.worker.lock().unwrap().take()
+        poison_lock(&self.worker).take()
     }
 
     fn put_back(&self, w: Worker) {
-        *self.worker.lock().unwrap() = Some(w);
+        *poison_lock(&self.worker) = Some(w);
     }
 
     fn spawn_worker(&self) -> Result<Worker, String> {
@@ -137,7 +146,7 @@ impl WorkerSlot {
                 match reader.read_line(&mut line).await {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        let mut t = tail.lock().unwrap();
+                        let mut t = poison_lock(&tail);
                         t.push(line.trim_end().to_string());
                         let len = t.len();
                         if len > STDERR_TAIL_LINES {
@@ -161,15 +170,40 @@ impl WorkerSlot {
         }
     }
 
+    /// Supervisor escape hatch: kill the tree of the worker currently
+    /// mid-op (tracked by pid — during a wedged exec the Worker object is
+    /// owned by exec's stack frame, not the slot). The kill lands as EOF
+    /// in the parked roundtrip read, which unwinds exec's error path
+    /// normally. Bounded: a hung taskkill must not wedge the supervisor.
+    pub async fn kill_running(&self) -> bool {
+        let pid = *poison_lock(&self.running_pid);
+        if pid == 0 {
+            return false;
+        }
+        let mut kill = tokio::process::Command::new("taskkill");
+        kill.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            kill.creation_flags(CREATE_NO_WINDOW);
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(15), kill.status()).await;
+        true
+    }
+
     /// Test seam: plant a duplex-injected worker so exec() runs against a
     /// scripted peer instead of spawning pwsh.
     #[cfg(test)]
     fn plant_for_test(&self, w: Worker) {
-        *self.worker.lock().unwrap() = Some(w);
+        *poison_lock(&self.worker) = Some(w);
     }
 }
 
 impl Worker {
+    fn pid(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|c| c.id())
+    }
+
     async fn roundtrip(
         &mut self,
         line: &str,
@@ -177,7 +211,7 @@ impl Worker {
         timeout: Duration,
         tail: &Arc<Mutex<Vec<String>>>,
     ) -> Result<Value, Value> {
-        let tail_str = || tail.lock().unwrap().join("\n");
+        let tail_str = || poison_lock(tail).join("\n");
         let io = async {
             self.stdin
                 .write_all(line.as_bytes())
@@ -272,7 +306,9 @@ impl Worker {
     }
 
     /// taskkill /T /F the whole tree (ops spawn native children that a
-    /// bare child.kill() would orphan), then reap.
+    /// bare child.kill() would orphan), then reap. Bounded: a hung
+    /// taskkill must not wedge the dispatcher forever — that was one of
+    /// the observed hang modes.
     async fn kill_tree(&mut self) {
         if let Some(child) = self.child.as_mut() {
             if let Some(pid) = child.id() {
@@ -283,7 +319,7 @@ impl Worker {
                     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                     kill.creation_flags(CREATE_NO_WINDOW);
                 }
-                let _ = kill.status().await;
+                let _ = tokio::time::timeout(Duration::from_secs(15), kill.status()).await;
             }
             let _ = child.kill().await;
         }
@@ -460,12 +496,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err["error"]["code"], "pwsh_protocol");
-        assert!(
-            err["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("not base64")
-        );
+        assert!(err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not base64"));
     }
 
     #[tokio::test]
@@ -481,12 +515,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err["error"]["code"], "pwsh_protocol");
-        assert!(
-            err["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("mismatch")
-        );
+        assert!(err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("mismatch"));
         peer.await.unwrap();
     }
 

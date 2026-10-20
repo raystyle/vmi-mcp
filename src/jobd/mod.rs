@@ -2,25 +2,38 @@
 //!
 //! Tool set mirrors the daemon.ps1 file-queue era so the Python jobface
 //! keeps its shape: job_submit/status/wait/cancel/list/last plus
-//! daemon_status/daemon_stop. Ops run serially on one warm pwsh worker;
-//! the op table (timeouts) stays on the Python side — the daemon only
-//! executes and remembers results.
+//! daemon_status/daemon_stop. Ops run serially on one warm pwsh worker.
+//! The op table (timeouts) arrives per-job from the Python side — and the
+//! daemon now ENFORCES it twice: the worker roundtrip has its own
+//! tokio timeout, and the watchdog's stale-job supervisor reaps any
+//! running job that blows deadline + grace, converting the wedge into a
+//! terminal op_timeout envelope and killing the wedged worker tree.
 
 pub mod queue;
 pub mod worker;
 
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rmcp::handler::server::wrapper::Json;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{ErrorData, schemars, tool, tool_router};
-use serde_json::{Value, json};
+use rmcp::{schemars, tool, tool_router, ErrorData};
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use queue::Queue;
 use worker::WorkerSlot;
+
+/// Lock helper that survives a poisoned mutex instead of panicking the
+/// tokio runtime: a panic in one lock section must not take the whole
+/// daemon down (that IS the dispatcher-hang disease we are fixing).
+/// Recovered poison means whatever mutation was in flight was abandoned;
+/// the map itself is allocation-consistent, so continue on it.
+fn poison_lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// Elevated daemon's pipe, connectable by same-machine non-elevated
 /// users (GWGR for Authenticated Users): the elevated context is the
@@ -280,7 +293,12 @@ pub async fn run_jobd(
                 timeout,
             }) = rx.recv().await
             {
-                queue.mark_running(&id);
+                // pending -> running with the deadline the supervisor
+                // enforces; a job cancelled while queued is skipped
+                if !queue.mark_running(&id, timeout.as_secs()) {
+                    queue.log(&format!("job {id} skipped: cancelled before dispatch"));
+                    continue;
+                }
                 let envelope = match worker.exec(&request, timeout).await {
                     Ok(e) => e,
                     Err(e) => e,
