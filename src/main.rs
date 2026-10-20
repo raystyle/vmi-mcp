@@ -51,7 +51,7 @@ use rmcp::handler::server::wrapper::Json;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{ErrorData, schemars, tool, tool_router};
+use rmcp::{schemars, tool, tool_router, ErrorData};
 
 mod jobd;
 mod pipe;
