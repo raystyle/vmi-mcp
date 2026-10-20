@@ -124,6 +124,7 @@ pub struct Queue {
     counter: AtomicU32,
     boot_nonce: u32,
     started: std::time::Instant,
+    booted_at: String,
     pwsh_version: String,
     /// supervisor reaped-job total (surfaced in daemon_status for doctor)
     reaped_count: AtomicUsize,
@@ -145,6 +146,7 @@ impl Queue {
             counter: AtomicU32::new(1),
             boot_nonce,
             started: std::time::Instant::now(),
+            booted_at: now_iso(),
             pwsh_version,
             reaped_count: AtomicUsize::new(0),
             done_count: std::sync::atomic::AtomicUsize::new(0),
@@ -345,7 +347,7 @@ impl Queue {
         let (pending, running, done) = self.counts();
         json!({
             "pid": std::process::id(),
-            "started": now_iso(),
+            "started": self.booted_at,
             "uptime_s": self.started.elapsed().as_secs(),
             "pwsh_version": self.pwsh_version,
             "mode": "jobd",
